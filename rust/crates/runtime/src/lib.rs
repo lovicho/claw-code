@@ -65,11 +65,12 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    suppress_config_warnings_for_json_mode, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
-    McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
-    McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
-    McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
-    RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
+    suppress_config_warnings_for_json_mode, ConfigEntry, ConfigError, ConfigFileReport,
+    ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource, McpConfigCollection,
+    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
+    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+    ProviderFallbackConfig, ResolvedPermissionMode, RulesImportConfig, RuntimeConfig,
+    RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig, RuntimePermissionRuleConfig,
     RuntimePluginConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{

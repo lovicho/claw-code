@@ -24,6 +24,13 @@ fn help_emits_json_when_requested() {
         .as_str()
         .expect("help text")
         .contains("Usage:"));
+    assert!(
+        parsed["message"]
+            .as_str()
+            .expect("help text")
+            .contains("--cwd PATH, -C PATH, --directory PATH"),
+        "help JSON should document global cwd override (#429): {parsed}"
+    );
 }
 
 #[test]
@@ -122,6 +129,133 @@ fn doctor_help_text_stays_plaintext_and_local_702() {
     assert!(stdout.contains("Usage            claw doctor"));
     assert!(stdout.contains("no provider request or session resume required"));
     serde_json::from_str::<Value>(&stdout).expect_err("text help should remain plaintext");
+}
+
+#[test]
+fn resume_session_compact_help_short_circuits_before_config_or_auth_427() {
+    let root = unique_temp_dir("session-help-local-427");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(root.join(".claw")).expect("project config dir should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(root.join(".claw").join("settings.json"), "{").expect("broken config should write");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+        ("ANTHROPIC_API_KEY", ""),
+        ("ANTHROPIC_AUTH_TOKEN", ""),
+        ("OPENAI_API_KEY", ""),
+    ];
+
+    let text_cases: &[(&[&str], &str)] = &[
+        (&["resume", "--help"], "Resume\n"),
+        (&["--resume", "--help"], "Resume\n"),
+        (&["session", "--help"], "Session\n"),
+        (&["compact", "--help"], "Compact\n"),
+    ];
+    for (args, heading) in text_cases {
+        let output = run_claw(&root, args, &envs);
+        assert!(
+            output.status.success(),
+            "{args:?} should exit 0 before auth/config; stdout:\n{}\n\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.starts_with(heading), "{args:?} stdout: {stdout}");
+        assert!(stdout.contains("Usage"), "{args:?} stdout: {stdout}");
+        assert!(
+            !stdout.contains("missing_credentials") && !stderr.contains("missing_credentials"),
+            "{args:?} must not hit provider auth: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            !stdout.contains("config_parse_error") && stderr.is_empty(),
+            "{args:?} must not load broken config: stdout={stdout:?} stderr={stderr:?}"
+        );
+        serde_json::from_str::<Value>(&stdout).expect_err("text help should remain plaintext");
+    }
+
+    let json_cases: &[(&[&str], &str)] = &[
+        (&["resume", "--help", "--output-format", "json"], "resume"),
+        (&["--resume", "--help", "--output-format", "json"], "resume"),
+        (&["session", "--help", "--output-format", "json"], "session"),
+        (&["compact", "--help", "--output-format", "json"], "compact"),
+    ];
+    for (args, topic) in json_cases {
+        let parsed = assert_json_command_with_env(&root, args, &envs);
+        assert_eq!(parsed["kind"], "help", "{args:?}: {parsed}");
+        assert_eq!(parsed["status"], "ok", "{args:?}: {parsed}");
+        assert_eq!(parsed["topic"], *topic, "{args:?}: {parsed}");
+        assert!(
+            parsed["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Usage")),
+            "{args:?} should include static usage text: {parsed}"
+        );
+    }
+}
+
+#[test]
+fn resume_missing_session_json_reports_local_store_before_auth_427() {
+    let root = unique_temp_dir("resume-missing-local-427");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+        ("ANTHROPIC_API_KEY", ""),
+        ("ANTHROPIC_AUTH_TOKEN", ""),
+        ("OPENAI_API_KEY", ""),
+    ];
+
+    let output = run_claw(
+        &root,
+        &[
+            "resume",
+            "definitely-missing-session",
+            "--output-format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "missing session should exit 1"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.is_empty(),
+        "JSON missing-session stderr should be empty: {stderr:?}"
+    );
+    assert!(
+        !stdout.contains("missing_credentials") && !stderr.contains("missing_credentials"),
+        "missing session must not reach provider auth: stdout={stdout:?} stderr={stderr:?}"
+    );
+    let parsed: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("resume missing session must emit JSON, got: {stdout:?}"));
+    assert_eq!(parsed["error_kind"], "session_not_found", "{parsed}");
+    assert_eq!(parsed["action"], "restore", "{parsed}");
+    assert!(
+        parsed["sessions_dir"]
+            .as_str()
+            .is_some_and(|path| path.contains(".claw") && path.contains("sessions")),
+        "missing-session JSON should expose the searched sessions_dir: {parsed}"
+    );
 }
 
 #[test]
@@ -305,6 +439,277 @@ fn status_json_surfaces_permission_mode_override_for_security_audit() {
     );
 
     fs::remove_dir_all(root).expect("cleanup temp dir");
+}
+
+#[test]
+fn default_permission_mode_is_workspace_write_and_audited_428() {
+    let root = unique_temp_dir("default-permission-mode-428");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+        ("RUSTY_CLAUDE_PERMISSION_MODE", ""),
+    ];
+
+    let status = assert_json_command_with_env(&root, &["--output-format", "json", "status"], &envs);
+    assert_eq!(status["permission_mode"], "workspace-write");
+    assert_eq!(status["permission_mode_source"], "default");
+
+    let doctor = assert_json_command_with_env(&root, &["--output-format", "json", "doctor"], &envs);
+    let permissions = doctor["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "permissions")
+        .expect("permissions check");
+    assert_eq!(permissions["status"], "ok");
+    assert_eq!(permissions["mode"], "workspace-write");
+    assert_eq!(permissions["source"], "default");
+    assert_eq!(
+        permissions["message"],
+        "default permission mode is workspace-write"
+    );
+}
+
+#[test]
+fn explicit_danger_permission_mode_is_audited_and_alias_supported_428() {
+    let root = unique_temp_dir("danger-permission-mode-428");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let status = assert_json_command(
+        &root,
+        &["--skip-permissions", "--output-format", "json", "status"],
+    );
+    assert_eq!(status["permission_mode"], "danger-full-access");
+    assert_eq!(status["permission_mode_source"], "flag");
+
+    let doctor = assert_json_command(
+        &root,
+        &[
+            "--permission-mode",
+            "danger-full-access",
+            "--output-format",
+            "json",
+            "doctor",
+        ],
+    );
+    let permissions = doctor["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "permissions")
+        .expect("permissions check");
+    assert_eq!(permissions["status"], "ok");
+    assert_eq!(permissions["mode"], "danger-full-access");
+    assert_eq!(permissions["source"], "flag");
+    assert_eq!(permissions["source_explicit"], true);
+}
+
+#[test]
+fn invalid_permission_mode_json_is_typed_428() {
+    let root = unique_temp_dir("invalid-permission-mode-428");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let output = run_claw(
+        &root,
+        &[
+            "--permission-mode",
+            "bogus-mode",
+            "status",
+            "--output-format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("invalid permission mode must emit JSON, got: {stdout:?}"));
+    assert_eq!(parsed["error_kind"], "invalid_permission_mode");
+    assert_eq!(parsed["kind"], "invalid_permission_mode");
+    assert!(
+        stderr.is_empty(),
+        "JSON error stderr should be empty: {stderr:?}"
+    );
+}
+
+#[test]
+fn global_cwd_flag_routes_status_workspace_and_short_alias_429() {
+    let parent = unique_temp_dir("global-cwd-parent-429");
+    let workspace = parent.join("workspace");
+    let launcher = parent.join("launcher");
+    fs::create_dir_all(&workspace).expect("workspace dir should exist");
+    fs::create_dir_all(&launcher).expect("launcher dir should exist");
+
+    let workspace_str = workspace.to_str().expect("utf8 workspace");
+    let expected_cwd = fs::canonicalize(&workspace)
+        .expect("workspace should canonicalize")
+        .display()
+        .to_string();
+    let status = assert_json_command(
+        &launcher,
+        &["--cwd", workspace_str, "--output-format", "json", "status"],
+    );
+    assert_eq!(status["kind"], "status");
+    assert_eq!(status["workspace"]["cwd"], expected_cwd);
+
+    let short_status = assert_json_command(
+        &launcher,
+        &["-C", workspace_str, "status", "--output-format", "json"],
+    );
+    assert_eq!(short_status["workspace"]["cwd"], expected_cwd);
+
+    let directory_status = assert_json_command(
+        &launcher,
+        &[
+            "--directory",
+            workspace_str,
+            "--output-format=json",
+            "status",
+        ],
+    );
+    assert_eq!(directory_status["workspace"]["cwd"], expected_cwd);
+}
+
+#[test]
+fn global_cwd_flag_reports_typed_invalid_paths_429() {
+    let root = unique_temp_dir("global-cwd-invalid-429");
+    let file = root.join("not-a-directory");
+    fs::create_dir_all(&root).expect("root dir should exist");
+    fs::write(&file, "not a dir").expect("file fixture should write");
+
+    let missing = root.join("missing");
+    let output = run_claw(
+        &root,
+        &[
+            "--cwd",
+            missing.to_str().expect("utf8 missing path"),
+            "status",
+            "--output-format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("invalid cwd should emit JSON, got: {stdout:?}"));
+    assert_eq!(parsed["kind"], "invalid_cwd");
+    assert_eq!(parsed["error_kind"], "invalid_cwd");
+    assert_eq!(parsed["reason"], "not_found");
+    assert_eq!(parsed["path"], missing.to_str().expect("utf8 missing path"));
+    assert!(output.stderr.is_empty());
+
+    let file_output = run_claw(
+        &root,
+        &[
+            "--cwd",
+            file.to_str().expect("utf8 file path"),
+            "status",
+            "--output-format=json",
+        ],
+        &[],
+    );
+    assert_eq!(file_output.status.code(), Some(1));
+    let file_stdout = String::from_utf8_lossy(&file_output.stdout);
+    let file_json: Value = serde_json::from_str(file_stdout.trim())
+        .unwrap_or_else(|_| panic!("file cwd should emit JSON, got: {file_stdout:?}"));
+    assert_eq!(file_json["kind"], "invalid_cwd");
+    assert_eq!(file_json["reason"], "not_a_directory");
+
+    let empty_output = run_claw(&root, &["--cwd", "", "status", "--output-format=json"], &[]);
+    assert_eq!(empty_output.status.code(), Some(1));
+    let empty_stdout = String::from_utf8_lossy(&empty_output.stdout);
+    let empty_json: Value = serde_json::from_str(empty_stdout.trim())
+        .unwrap_or_else(|_| panic!("empty cwd should emit JSON, got: {empty_stdout:?}"));
+    assert_eq!(empty_json["kind"], "invalid_cwd");
+    assert_eq!(empty_json["reason"], "empty");
+}
+
+#[test]
+fn status_json_accepts_namespaced_model_env_and_surfaces_alias_426() {
+    let root = unique_temp_dir("status-model-env-426");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+        ("CLAW_MODEL", "opus"),
+        ("ANTHROPIC_MODEL", ""),
+        ("ANTHROPIC_DEFAULT_MODEL", ""),
+    ];
+    let parsed = assert_json_command_with_env(&root, &["--output-format", "json", "status"], &envs);
+
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["model"], "anthropic/claude-opus-4-7");
+    assert_eq!(parsed["model_source"], "env");
+    assert_eq!(parsed["model_raw"], "opus");
+    assert_eq!(
+        parsed["model_alias_resolved_to"],
+        "anthropic/claude-opus-4-7"
+    );
+    assert_eq!(parsed["model_env_var"], "CLAW_MODEL");
+}
+
+#[test]
+fn status_json_warns_on_invalid_model_env_426() {
+    let root = unique_temp_dir("status-invalid-model-env-426");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+        ("CLAW_MODEL", ""),
+        ("ANTHROPIC_MODEL", "bogus-model-xyz"),
+        ("ANTHROPIC_DEFAULT_MODEL", ""),
+    ];
+    let output = run_claw(&root, &["--output-format", "json", "status"], &envs);
+    assert!(
+        output.status.success(),
+        "invalid env model should produce status warn, not process abort; stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("stdout valid json");
+
+    assert_eq!(parsed["kind"], "status");
+    assert_eq!(parsed["status"], "warn");
+    assert_eq!(parsed["model"], Value::Null);
+    assert_eq!(parsed["model_validation_error_kind"], "invalid_model");
+    assert_eq!(parsed["error_kind"], "invalid_model");
+    assert!(
+        parsed["model_validation_error"]
+            .as_str()
+            .is_some_and(|message| message.contains("ANTHROPIC_MODEL")
+                && message.contains("bogus-model-xyz")),
+        "warning should name env var and raw model: {parsed}"
+    );
+    assert!(
+        parsed["workspace"].is_object(),
+        "status warning should keep local context: {parsed}"
+    );
 }
 
 #[test]
@@ -1456,6 +1861,271 @@ fn config_json_reports_deprecations_structurally_without_stderr_duplicate_815() 
         text_stderr.contains("field \"enabledPlugins\" is deprecated"),
         "text config should keep human-readable config warnings on stderr"
     );
+}
+
+#[test]
+fn status_deduplicates_config_deprecation_warnings_per_invocation_425() {
+    let root = unique_temp_dir("status-warning-dedup-425");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(
+        config_home.join("settings.json"),
+        r#"{"enabledPlugins": {}}"#,
+    )
+    .expect("deprecated config fixture should write");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+    ];
+    let output = run_claw(&root, &["status"], &envs);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    let warning_count = stderr
+        .matches("field \"enabledPlugins\" is deprecated")
+        .count();
+    assert_eq!(
+        warning_count, 1,
+        "status should emit the deprecated enabledPlugins warning once per process:\n{stderr}"
+    );
+}
+
+#[test]
+fn config_json_attributes_precedence_and_shadowed_keys_425() {
+    let root = unique_temp_dir("config-precedence-425");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(root.join(".claw")).expect("workspace config should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(
+        root.join(".claw.json"),
+        r#"{"model":"anthropic/claude-sonnet-4-6","env":{"A":"legacy","B":"legacy"}}"#,
+    )
+    .expect("legacy project config fixture should write");
+    fs::write(
+        root.join(".claw").join("settings.json"),
+        r#"{"model":"anthropic/claude-opus-4-6","env":{"A":"settings","C":"settings"}}"#,
+    )
+    .expect("project settings fixture should write");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+    ];
+    let parsed = assert_json_command_with_env(&root, &["--output-format", "json", "config"], &envs);
+    let files = parsed["files"].as_array().expect("files array");
+    let legacy = files
+        .iter()
+        .find(|file| {
+            file["source"] == "project"
+                && file["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with(".claw.json"))
+        })
+        .expect("project .claw.json entry");
+    let settings = files
+        .iter()
+        .find(|file| {
+            file["source"] == "project"
+                && file["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with(".claw/settings.json"))
+        })
+        .expect("project .claw/settings.json entry");
+
+    assert_eq!(legacy["status"], "loaded");
+    assert_eq!(settings["status"], "loaded");
+    assert!(
+        settings["precedence_rank"].as_u64().expect("settings rank")
+            > legacy["precedence_rank"].as_u64().expect("legacy rank"),
+        "later project settings must outrank legacy project config: legacy={legacy} settings={settings}"
+    );
+    for key in ["model", "env.A"] {
+        assert!(
+            legacy["shadowed_keys"]
+                .as_array()
+                .expect("legacy shadowed keys")
+                .iter()
+                .any(|value| value.as_str() == Some(key)),
+            "legacy config should report {key} as shadowed: {legacy}"
+        );
+        assert!(
+            settings["wins_for_keys"]
+                .as_array()
+                .expect("settings winning keys")
+                .iter()
+                .any(|value| value.as_str() == Some(key)),
+            "project settings should report {key} as winning: {settings}"
+        );
+    }
+    assert!(
+        legacy["wins_for_keys"]
+            .as_array()
+            .expect("legacy winning keys")
+            .iter()
+            .any(|value| value.as_str() == Some("env.B")),
+        "unshadowed legacy keys should remain attributed to .claw.json: {legacy}"
+    );
+}
+
+#[test]
+fn config_section_json_tolerates_unknown_keys_as_warnings_425() {
+    let root = unique_temp_dir("config-unknown-warning-425");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(root.join(".claw.json"), r#"{"model":"opus","alpha":"x"}"#)
+        .expect("legacy config fixture should write");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+    ];
+    let parsed = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "config", "model"],
+        &envs,
+    );
+
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["section"], "model");
+    assert_eq!(parsed["section_value"], "opus");
+    assert!(
+        parsed["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.contains("unknown key \"alpha\""))),
+        "unknown keys should be structural warnings, not section failures: {parsed}"
+    );
+}
+
+#[test]
+fn config_json_reports_structured_unloaded_file_reasons_407() {
+    let root = unique_temp_dir("config-file-status-407");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(root.join(".claw")).expect("workspace config should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(root.join(".claw.json"), "{not json").expect("legacy skip fixture should write");
+    fs::write(
+        root.join(".claw").join("settings.json"),
+        r#"{"model":"opus"}"#,
+    )
+    .expect("project config fixture should write");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+    ];
+    let output = run_claw(&root, &["--output-format", "json", "config"], &envs);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("stdout valid json");
+
+    assert_eq!(parsed["kind"], "config");
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["loaded_files"], 1);
+    assert_eq!(parsed["merged_keys"], parsed["merged_key_count"]);
+    assert_eq!(
+        parsed["merged_keys_meaning"].as_str(),
+        Some("count of top-level keys in the effective merged JSON object")
+    );
+    assert!(parsed["load_error"].is_null());
+
+    let files = parsed["files"].as_array().expect("files array");
+    let loaded = files
+        .iter()
+        .find(|file| file["loaded"] == true)
+        .expect("loaded config file");
+    assert_eq!(loaded["status"], "loaded");
+    assert!(loaded.get("reason").is_none());
+    let missing = files
+        .iter()
+        .find(|file| file["status"] == "not_found")
+        .expect("missing config file");
+    assert_eq!(missing["loaded"], false);
+    assert_eq!(missing["reason"], "not_found");
+    assert_eq!(missing["skip_reason"], "not_found");
+    let skipped = files
+        .iter()
+        .find(|file| file["status"] == "skipped")
+        .expect("skipped legacy config file");
+    assert_eq!(skipped["loaded"], false);
+    assert_eq!(skipped["reason"], "legacy_invalid_json");
+    assert_eq!(skipped["skip_reason"], "legacy_invalid_json");
+    assert!(skipped["detail"].as_str().is_some());
+}
+
+#[test]
+fn config_json_list_reports_parse_errors_without_dropping_file_statuses_407() {
+    let root = unique_temp_dir("config-file-load-error-407");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(root.join(".claw")).expect("workspace config should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(config_home.join("settings.json"), r#"{"model":"sonnet"}"#)
+        .expect("user config fixture should write");
+    fs::write(root.join(".claw").join("settings.json"), "{not json")
+        .expect("invalid project config fixture should write");
+
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+    ];
+    let output = run_claw(&root, &["--output-format", "json", "config"], &envs);
+    assert!(
+        output.status.success(),
+        "config list should be best-effort even with one parse-broken file; stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("stdout valid json");
+
+    assert_eq!(parsed["status"], "error");
+    assert!(parsed["load_error"].as_str().is_some());
+    assert_eq!(parsed["loaded_files"], 1);
+    let files = parsed["files"].as_array().expect("files array");
+    let error_file = files
+        .iter()
+        .find(|file| file["status"] == "load_error")
+        .expect("load error config file");
+    assert_eq!(error_file["loaded"], false);
+    assert_eq!(error_file["reason"], "parse_error");
+    assert_eq!(error_file["skip_reason"], "parse_error");
+    assert!(error_file["detail"].as_str().is_some());
 }
 
 #[test]

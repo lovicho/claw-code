@@ -514,7 +514,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["url", "prompt"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::ReadOnly,
+            required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "WebSearch",
@@ -535,7 +535,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["query"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::ReadOnly,
+            required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "TodoWrite",
@@ -1225,13 +1225,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "GitShow",
-            description: "Show a commit, tag, or tree object with its diff. Supports showing a specific file at a commit (commit:path) and stat-only mode. Use this instead of running git show via bash to get structured output.",
+            description: "Show a commit, tag, or tree object. Use format to control output: patch (default) shows the full diff, stat shows a diffstat summary, and metadata shows commit info without the diff. Supports showing a specific file at a commit (commit:path) for patch/stat output. Use this instead of running git show via bash to get structured output.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "commit": { "type": "string" },
                     "path": { "type": "string" },
-                    "stat": { "type": "boolean" }
+                    "stat": { "type": "boolean" },
+                    "format": { "type": "string", "enum": ["patch", "stat", "metadata"] },
                 },
                 "required": ["commit"],
                 "additionalProperties": false
@@ -1320,8 +1321,26 @@ fn execute_tool_with_enforcer(
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
             run_grep_search(grep_input)
         }
-        "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
-        "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
+        "WebFetch" => {
+            let web_input = from_value::<WebFetchInput>(input)?;
+            maybe_enforce_permission_check_with_mode(
+                enforcer,
+                name,
+                input,
+                PermissionMode::DangerFullAccess,
+            )?;
+            run_web_fetch(web_input)
+        }
+        "WebSearch" => {
+            let web_input = from_value::<WebSearchInput>(input)?;
+            maybe_enforce_permission_check_with_mode(
+                enforcer,
+                name,
+                input,
+                PermissionMode::DangerFullAccess,
+            )?;
+            run_web_search(web_input)
+        }
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
@@ -2008,14 +2027,37 @@ fn run_git_log(input: GitLogInput) -> Result<String, String> {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 /// Execute `git show` for a given commit, optionally with --stat or a file path.
 /// Uses the `commit:path` syntax when a path is specified.
 fn run_git_show(input: GitShowInput) -> Result<String, String> {
     let mut args: Vec<String> = vec!["show".to_string()];
-    if input.stat.unwrap_or(false) {
-        args.push("--stat".to_string());
+
+    match input.format.as_deref() {
+        Some("metadata") if input.path.is_some() => {
+            return Err(
+                "GitShow format \"metadata\" cannot be combined with path; metadata describes a commit, not a blob. Use format \"patch\" or \"stat\" with path, or omit path."
+                    .to_string(),
+            );
+        }
+        Some("metadata") => {
+            args.push("--format=medium".to_string());
+            args.push("--no-patch".to_string());
+        }
+        Some("stat") => {
+            args.push("--stat".to_string());
+        }
+        Some("patch") | None => {
+            if input.format.is_none() && input.stat.unwrap_or(false) {
+                args.push("--stat".to_string());
+            }
+        }
+        Some(other) => {
+            return Err(format!(
+                "unknown GitShow format: \"{other}\". Supported values: \"patch\" (default), \"stat\", \"metadata\"."
+            ));
+        }
     }
+
     if let Some(ref path) = input.path {
         args.push(format!("{}:{}", input.commit, path));
     } else {
@@ -2964,6 +3006,9 @@ struct GitShowInput {
     #[serde(default)]
     /// If true, show diffstat summary instead of full diff.
     stat: Option<bool>,
+    #[serde(default)]
+    /// Output format: "patch" (default) shows the full diff, "stat" shows a diffstat summary, and "metadata" shows commit info without the diff. When set, takes priority over `stat`.
+    format: Option<String>,
 }
 
 /// Input for the GitBlame tool: shows per-line author/revision info for a file.
@@ -6780,6 +6825,87 @@ mod tests {
     }
 
     #[test]
+    fn git_show_schema_exposes_format_enum() {
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "GitShow")
+            .expect("GitShow spec");
+        assert_eq!(
+            spec.input_schema["properties"]["format"]["enum"],
+            json!(["patch", "stat", "metadata"])
+        );
+    }
+
+    #[test]
+    fn git_show_supports_patch_stat_metadata_and_rejects_metadata_path() {
+        let _guard = env_guard();
+        let root = temp_path("git-show-format");
+        init_git_repo(&root);
+        commit_file(&root, "README.md", "initial\nupdated\n", "update readme");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let patch = execute_tool("GitShow", &json!({"commit": "HEAD", "format": "patch"}))
+            .expect("patch git show");
+        let patch: serde_json::Value = serde_json::from_str(&patch).expect("patch json");
+        assert!(patch["output"]
+            .as_str()
+            .expect("patch output")
+            .contains("diff --git"));
+
+        let stat = execute_tool("GitShow", &json!({"commit": "HEAD", "format": "stat"}))
+            .expect("stat git show");
+        let stat: serde_json::Value = serde_json::from_str(&stat).expect("stat json");
+        assert!(stat["output"]
+            .as_str()
+            .expect("stat output")
+            .contains("README.md"));
+
+        let legacy_stat = execute_tool("GitShow", &json!({"commit": "HEAD", "stat": true}))
+            .expect("legacy stat git show");
+        let legacy_stat: serde_json::Value =
+            serde_json::from_str(&legacy_stat).expect("legacy stat json");
+        assert!(legacy_stat["output"]
+            .as_str()
+            .expect("legacy stat output")
+            .contains("README.md"));
+
+        let metadata = execute_tool("GitShow", &json!({"commit": "HEAD", "format": "metadata"}))
+            .expect("metadata git show");
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).expect("metadata json");
+        let metadata_output = metadata["output"].as_str().expect("metadata output");
+        assert!(metadata_output.contains("commit "));
+        assert!(metadata_output.contains("update readme"));
+        assert!(!metadata_output.contains("diff --git"));
+
+        let file_patch = execute_tool(
+            "GitShow",
+            &json!({"commit": "HEAD", "path": "README.md", "format": "patch"}),
+        )
+        .expect("file patch git show");
+        let file_patch: serde_json::Value =
+            serde_json::from_str(&file_patch).expect("file patch json");
+        assert_eq!(
+            file_patch["output"].as_str().expect("file patch output"),
+            "initial\nupdated"
+        );
+
+        let metadata_path = execute_tool(
+            "GitShow",
+            &json!({"commit": "HEAD", "path": "README.md", "format": "metadata"}),
+        )
+        .expect_err("metadata with path should be rejected");
+        assert!(metadata_path.contains("cannot be combined with path"));
+
+        let invalid = execute_tool("GitShow", &json!({"commit": "HEAD", "format": "bogus"}))
+            .expect_err("invalid format should be rejected");
+        assert!(invalid.contains("unknown GitShow format"));
+
+        std::env::set_current_dir(&previous).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rejects_unknown_tool_names() {
         let error = execute_tool("nope", &json!({})).expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool"));
@@ -10154,6 +10280,26 @@ printf 'pwsh:%s' "$1"
             err.contains("current mode is 'read-only'"),
             "should cite active mode: {err}"
         );
+    }
+
+    #[test]
+    fn given_workspace_write_enforcer_when_web_tools_then_denied() {
+        let registry = workspace_write_registry();
+        for (tool, input) in [
+            (
+                "WebFetch",
+                json!({"url":"https://example.com", "prompt":"summarize"}),
+            ),
+            ("WebSearch", json!({"query":"rust language"})),
+        ] {
+            let err = registry
+                .execute(tool, &input)
+                .expect_err("network tools should require explicit full access");
+            assert!(
+                err.contains("requires 'danger-full-access'"),
+                "{tool} should require elevated mode: {err}"
+            );
+        }
     }
 
     #[test]
