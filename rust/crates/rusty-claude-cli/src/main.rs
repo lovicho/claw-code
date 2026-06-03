@@ -297,6 +297,8 @@ fn classify_error_kind(message: &str) -> &'static str {
         "session_load_failed"
     } else if message.contains("unsupported ACP invocation") {
         "unsupported_acp_invocation"
+    } else if message.starts_with("missing_argument:") {
+        "missing_argument"
     } else if message.contains("unsupported skills action") {
         "unsupported_skills_action"
     } else if message.contains("unrecognized argument") || message.contains("unknown option") {
@@ -645,6 +647,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         },
+        CliAction::Models {
+            action,
+            output_format,
+        } => print_models(action.as_deref(), output_format)?,
         CliAction::Diff { output_format } => match output_format {
             CliOutputFormat::Text => {
                 println!("{}", render_diff_report()?);
@@ -768,6 +774,10 @@ enum CliAction {
         section: Option<String>,
         output_format: CliOutputFormat,
     },
+    Models {
+        action: Option<String>,
+        output_format: CliOutputFormat,
+    },
     Diff {
         output_format: CliOutputFormat,
     },
@@ -815,6 +825,8 @@ enum LocalHelpTopic {
     Plugins,
     Mcp,
     Config,
+    Model,
+    Settings,
     Diff,
 }
 
@@ -1074,6 +1086,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 "plugins" | "plugin" | "marketplace" => Some(LocalHelpTopic::Plugins),
                 "mcp" => Some(LocalHelpTopic::Mcp),
                 "config" => Some(LocalHelpTopic::Config),
+                "model" | "models" => Some(LocalHelpTopic::Model),
+                "settings" => Some(LocalHelpTopic::Settings),
                 "diff" => Some(LocalHelpTopic::Diff),
                 _ => None,
             };
@@ -1290,10 +1304,23 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "interactive_only: `claw ultraplan` is a slash command.\nStart `claw` and run `/ultraplan` inside the REPL."
                 .to_string(),
         ),
-        "model" if rest.len() > 1 => Err(
-            "interactive_only: `claw model` is a slash command.\nStart `claw` and run `/model [model-name]` inside the REPL."
-                .to_string(),
-        ),
+        "model" | "models" => {
+            let tail = &rest[1..];
+            let action = tail.first().cloned();
+            if tail.len() > 1 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw {} {}`: {}\nUsage: claw {} [help] [--output-format json]",
+                    rest[0],
+                    tail[0],
+                    tail[1..].join(" "),
+                    rest[0]
+                ));
+            }
+            Ok(CliAction::Models {
+                action,
+                output_format,
+            })
+        }
         // #771: usage/stats/fork are slash-only verbs with no multi-arg match arms
         "usage" => Err(
             "interactive_only: `claw usage` is a slash command.\nUse `claw --resume SESSION.jsonl /usage` or start `claw` and run `/usage`."
@@ -1333,6 +1360,25 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     args,
                     output_format,
                 }),
+            }
+        }
+        "settings" => {
+            let tail = &rest[1..];
+            if tail.is_empty() {
+                Ok(CliAction::Config {
+                    section: Some("settings".to_string()),
+                    output_format,
+                })
+            } else if tail.len() == 1 && matches!(tail[0].as_str(), "help" | "--help" | "-h") {
+                Ok(CliAction::HelpTopic {
+                    topic: LocalHelpTopic::Settings,
+                    output_format,
+                })
+            } else {
+                Err(format!(
+                    "unexpected extra arguments after `claw settings`: {}\nUsage: claw settings [help] [--output-format json]",
+                    tail.join(" ")
+                ))
             }
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], model, output_format),
@@ -1379,13 +1425,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allow_broad_cwd,
         ),
         other => {
-            if rest.len() == 1 && looks_like_subcommand_typo(other) {
-                // #825: always emit a command_not_found error for
-                // single-word all-alpha/dash tokens that don't match any
-                // known subcommand — with or without close suggestions.
-                // Multi-word cases fall through to CliAction::Prompt so
-                // natural language prompts like `claw explain this` work.
-                // (#826 documents the multi-word gap as a known limitation.)
+            if looks_like_subcommand_typo(other)
+                && (rest.len() == 1 || output_format == CliOutputFormat::Json)
+            {
+                // #825/#826: emit command_not_found before provider startup for
+                // command-shaped tokens that do not match known subcommands.
+                // Text-mode multi-word prompt shorthand remains available, but
+                // JSON-mode automation must not turn an unknown command into a
+                // credential-gated prompt request.
                 let mut message = format!("command_not_found: unknown subcommand: {other}.");
                 if let Some(suggestions) = suggest_similar_subcommand(other) {
                     if let Some(line) = render_suggestion_line("Did you mean", &suggestions) {
@@ -1450,6 +1497,8 @@ fn parse_local_help_action(
         "system-prompt" => LocalHelpTopic::SystemPrompt,
         "dump-manifests" => LocalHelpTopic::DumpManifests,
         "bootstrap-plan" => LocalHelpTopic::BootstrapPlan,
+        "model" | "models" => LocalHelpTopic::Model,
+        "settings" => LocalHelpTopic::Settings,
         _ => return None,
     };
     let has_non_help = rest[1..].iter().any(|a| !is_help_flag(a));
@@ -1515,6 +1564,8 @@ fn parse_single_word_command_alias(
                 "plugins" | "plugin" | "marketplace" => Some(LocalHelpTopic::Plugins),
                 "mcp" => Some(LocalHelpTopic::Mcp),
                 "config" => Some(LocalHelpTopic::Config),
+                "model" | "models" => Some(LocalHelpTopic::Model),
+                "settings" => Some(LocalHelpTopic::Settings),
                 "diff" => Some(LocalHelpTopic::Diff),
                 _ => None,
             };
@@ -1564,6 +1615,8 @@ fn parse_single_word_command_alias(
             "plugins" | "plugin" | "marketplace" => Some(LocalHelpTopic::Plugins),
             "mcp" => Some(LocalHelpTopic::Mcp),
             "config" => Some(LocalHelpTopic::Config),
+            "model" | "models" => Some(LocalHelpTopic::Model),
+            "settings" => Some(LocalHelpTopic::Settings),
             "diff" => Some(LocalHelpTopic::Diff),
             _ => None,
         };
@@ -1707,6 +1760,17 @@ fn parse_direct_slash_cli_action(
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
         Ok(Some(SlashCommand::Help)) => Ok(CliAction::Help { output_format }),
+        Ok(Some(SlashCommand::Status)) => Ok(CliAction::Status {
+            model,
+            model_flag_raw: None,
+            permission_mode,
+            output_format,
+            allowed_tools,
+        }),
+        Ok(Some(SlashCommand::Sandbox)) => Ok(CliAction::Sandbox { output_format }),
+        Ok(Some(SlashCommand::Diff)) => Ok(CliAction::Diff { output_format }),
+        Ok(Some(SlashCommand::Version)) => Ok(CliAction::Version { output_format }),
+        Ok(Some(SlashCommand::Doctor)) => Ok(CliAction::Doctor { output_format }),
         Ok(Some(SlashCommand::Agents { args })) => Ok(CliAction::Agents {
             args,
             output_format,
@@ -2616,6 +2680,7 @@ fn render_doctor_report(
         session_lifecycle: classify_session_lifecycle_for(&cwd),
         boot_preflight,
         sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
+        binary_provenance: binary_provenance_for(Some(&cwd)),
         // Doctor path has its own config check; StatusContext here is only
         // fed into health renderers that don't read config_load_error.
         config_load_error: config.as_ref().err().map(ToString::to_string),
@@ -3233,6 +3298,14 @@ fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> D
     if let Some(model) = default_model {
         details.push(format!("Default model    {model}"));
     }
+    let binary_provenance = binary_provenance_for(Some(cwd));
+    details.push(format!(
+        "Binary provenance  status={} workspace_match={}",
+        binary_provenance.status(),
+        binary_provenance
+            .workspace_match
+            .map_or_else(|| "unknown".to_string(), |matches| matches.to_string())
+    ));
     DiagnosticCheck::new(
         "System",
         DiagnosticLevel::Ok,
@@ -3246,6 +3319,10 @@ fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> D
         ("version".to_string(), json!(VERSION)),
         ("build_target".to_string(), json!(BUILD_TARGET)),
         ("git_sha".to_string(), json!(GIT_SHA)),
+        (
+            "binary_provenance".to_string(),
+            binary_provenance.json_value(),
+        ),
         ("default_model".to_string(), json!(default_model)),
     ]))
 }
@@ -3429,17 +3506,19 @@ fn print_version(output_format: CliOutputFormat) -> Result<(), Box<dyn std::erro
 }
 
 fn version_json_value() -> serde_json::Value {
-    let executable_path = env::current_exe().ok().map(|p| p.display().to_string());
+    let cwd = env::current_dir().ok();
+    let binary_provenance = binary_provenance_for(cwd.as_deref());
     json!({
         "kind": "version",
         "action": "show",
         "status": "ok",
         "message": render_version_report(),
         "version": VERSION,
-        "git_sha": GIT_SHA,
-        "target": BUILD_TARGET,
-        "build_date": DEFAULT_DATE,
-        "executable_path": executable_path,
+        "git_sha": binary_provenance.git_sha,
+        "target": binary_provenance.target,
+        "build_date": binary_provenance.build_date,
+        "executable_path": binary_provenance.executable_path,
+        "binary_provenance": binary_provenance.json_value(),
     })
 }
 
@@ -3654,6 +3733,7 @@ struct StatusContext {
     session_lifecycle: SessionLifecycleSummary,
     boot_preflight: BootPreflightSnapshot,
     sandbox_status: runtime::SandboxStatus,
+    binary_provenance: BinaryProvenance,
     /// #143: when `.claw.json` (or another loaded config file) fails to parse,
     /// we capture the parse error here and still populate every field that
     /// doesn't depend on runtime config (workspace, git, sandbox defaults,
@@ -3666,6 +3746,87 @@ struct StatusContext {
     /// readable string so downstream claws can switch on the kind token
     /// instead of regex-scraping the prose.
     config_load_error_kind: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryProvenance {
+    git_sha: Option<String>,
+    target: Option<String>,
+    build_date: String,
+    executable_path: Option<String>,
+    workspace_git_sha: Option<String>,
+    workspace_match: Option<bool>,
+    hint: Option<String>,
+}
+
+impl BinaryProvenance {
+    fn status(&self) -> &'static str {
+        if self.git_sha.is_some() {
+            "known"
+        } else {
+            "unknown"
+        }
+    }
+
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "status": self.status(),
+            "git_sha": self.git_sha,
+            "target": self.target,
+            "build_date": self.build_date,
+            "executable_path": self.executable_path,
+            "workspace_git_sha": self.workspace_git_sha,
+            "workspace_match": self.workspace_match,
+            "hint": self.hint,
+        })
+    }
+}
+
+fn known_build_metadata(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() || value == "unknown" {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn binary_provenance_for(cwd: Option<&Path>) -> BinaryProvenance {
+    let git_sha = known_build_metadata(GIT_SHA);
+    let target = known_build_metadata(BUILD_TARGET);
+    let workspace_git_sha = cwd.and_then(|cwd| {
+        run_git_capture_in(cwd, &["rev-parse", "--short", "HEAD"])
+            .map(|sha| sha.trim().to_string())
+            .filter(|sha| !sha.is_empty())
+    });
+    let workspace_match = git_sha
+        .as_deref()
+        .zip(workspace_git_sha.as_deref())
+        .map(|(binary, workspace)| binary.starts_with(workspace) || workspace.starts_with(binary));
+    let hint = if git_sha.is_none() {
+        Some(
+            "Build metadata did not include a git SHA; rebuild from a git checkout before filing provenance-sensitive dogfood reports."
+                .to_string(),
+        )
+    } else if workspace_match == Some(false) {
+        Some(
+            "The running binary was built from a different commit than the current workspace HEAD; rebuild or switch binaries before attributing behavior to this checkout."
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    BinaryProvenance {
+        git_sha,
+        target,
+        build_date: DEFAULT_DATE.to_string(),
+        executable_path: env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string()),
+        workspace_git_sha,
+        workspace_match,
+        hint,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7436,6 +7597,7 @@ fn status_json_value(
             "restricted": allowed_tools.is_some(),
             "entries": allowed_tool_entries,
         },
+        "binary_provenance": context.binary_provenance.json_value(),
         "usage": {
             "messages": usage.message_count,
             "turns": usage.turns,
@@ -7563,6 +7725,7 @@ fn status_context(
         session_lifecycle: classify_session_lifecycle_for(&cwd),
         boot_preflight,
         sandbox_status,
+        binary_provenance: binary_provenance_for(Some(&cwd)),
         config_load_error,
         config_load_error_kind,
     })
@@ -7917,6 +8080,21 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Formats          text (default), json
   Related          /config · claw doctor"
             .to_string(),
+        LocalHelpTopic::Model => "Models
+  Usage            claw models [help] [--output-format <format>]
+  Aliases          claw model
+  Purpose          show bounded local model command guidance without entering the REPL
+  Output           supported model-selection surfaces and current config model value
+  Formats          text (default), json
+  Related          /model · claw config model · claw status"
+            .to_string(),
+        LocalHelpTopic::Settings => "Settings
+  Usage            claw settings [help] [--output-format <format>]
+  Purpose          show effective settings/config using the local config envelope
+  Output           same as claw config settings; no provider request or session resume required
+  Formats          text (default), json
+  Related          claw config · claw doctor"
+            .to_string(),
         LocalHelpTopic::Diff => "Diff
   Usage            claw diff [--output-format <format>]
   Purpose          show the diff of changes relative to the expected base commit
@@ -7944,8 +8122,75 @@ fn local_help_topic_command(topic: LocalHelpTopic) -> &'static str {
         LocalHelpTopic::Plugins => "plugins",
         LocalHelpTopic::Mcp => "mcp",
         LocalHelpTopic::Config => "config",
+        LocalHelpTopic::Model => "models",
+        LocalHelpTopic::Settings => "settings",
         LocalHelpTopic::Diff => "diff",
     }
+}
+
+fn print_models(
+    action: Option<&str>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let help_requested = action.is_some_and(|value| matches!(value, "help" | "--help" | "-h"));
+    if help_requested {
+        return print_help_topic(LocalHelpTopic::Model, output_format);
+    }
+    if let Some(action) = action {
+        return Err(format!(
+            "unsupported_models_action: unsupported models action: {action}.\nUsage: claw models [help] [--output-format json]"
+        )
+        .into());
+    }
+
+    let configured_model = config_model_for_current_dir();
+    let resolved_config_model = configured_model
+        .as_deref()
+        .map(resolve_model_alias_with_config);
+
+    match output_format {
+        CliOutputFormat::Text => {
+            println!("Models");
+            println!("  Default          {DEFAULT_MODEL}");
+            println!("  Built-in aliases opus, sonnet, haiku");
+            if let Some(raw) = configured_model.as_deref() {
+                println!(
+                    "  Config model     {raw}{}",
+                    resolved_config_model
+                        .as_deref()
+                        .filter(|resolved| *resolved != raw)
+                        .map(|resolved| format!(" -> {resolved}"))
+                        .unwrap_or_default()
+                );
+            } else {
+                println!("  Config model     <unset>");
+            }
+            println!("  Usage            claw --model <provider/model> prompt <text>");
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "models",
+                    "action": "list",
+                    "status": "ok",
+                    "default_model": DEFAULT_MODEL,
+                    "aliases": [
+                        {"name": "opus", "model": resolve_model_alias("opus")},
+                        {"name": "sonnet", "model": resolve_model_alias("sonnet")},
+                        {"name": "haiku", "model": resolve_model_alias("haiku")}
+                    ],
+                    "configured_model": configured_model,
+                    "resolved_configured_model": resolved_config_model,
+                    "local_only": true,
+                    "requires_credentials": false,
+                    "requires_provider_request": false,
+                    "message": "Use --model <provider/model> or configure a model in claw settings."
+                }))?
+            );
+        }
+    }
+    Ok(())
 }
 
 fn render_export_help_json() -> serde_json::Value {
@@ -8185,24 +8430,29 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
 
     if let Some(section) = section {
         lines.push(format!("Merged section: {section}"));
-        let value = match section {
-            "env" => runtime_config.get("env"),
-            "hooks" => runtime_config.get("hooks"),
-            "model" => runtime_config.get("model"),
+        let rendered = match section {
+            "env" => runtime_config.get("env").map(|value| value.render()),
+            "hooks" => runtime_config.get("hooks").map(|value| value.render()),
+            "model" => runtime_config.get("model").map(|value| value.render()),
             "plugins" => runtime_config
                 .get("plugins")
-                .or_else(|| runtime_config.get("enabledPlugins")),
+                .or_else(|| runtime_config.get("enabledPlugins"))
+                .map(|value| value.render()),
             "mcp" | "mcp_servers" | "mcpServers" => runtime_config
                 .get("mcp")
                 .or_else(|| runtime_config.get("mcp_servers"))
-                .or_else(|| runtime_config.get("mcpServers")),
-            "sandbox" => runtime_config.get("sandbox"),
-            "permissions" => runtime_config.get("permissions"),
-            "skills" => runtime_config.get("skills"),
-            "agents" => runtime_config.get("agents"),
+                .or_else(|| runtime_config.get("mcpServers"))
+                .map(|value| value.render()),
+            "sandbox" => runtime_config.get("sandbox").map(|value| value.render()),
+            "permissions" => runtime_config
+                .get("permissions")
+                .map(|value| value.render()),
+            "skills" => runtime_config.get("skills").map(|value| value.render()),
+            "agents" => runtime_config.get("agents").map(|value| value.render()),
+            "settings" => Some(runtime_config.as_json().render()),
             other => {
                 lines.push(format!(
-                    "  Unsupported config section '{other}'. Use: env, hooks, model, plugins, mcp, sandbox, permissions, skills, or agents."
+                    "  Unsupported config section '{other}'. Use: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents, or settings."
                 ));
                 return Ok(lines.join(
                     "
@@ -8212,10 +8462,7 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
         };
         lines.push(format!(
             "  {}",
-            match value {
-                Some(value) => value.render(),
-                None => "<unset>".to_string(),
-            }
+            rendered.unwrap_or_else(|| "<unset>".to_string())
         ));
         return Ok(lines.join(
             "
@@ -8305,16 +8552,17 @@ fn render_config_json(
             "permissions" => runtime_config.get("permissions").map(|v| v.render()),
             "skills" => runtime_config.get("skills").map(|v| v.render()),
             "agents" => runtime_config.get("agents").map(|v| v.render()),
+            "settings" => Some(runtime_config.as_json().render()),
             other => {
                 // #741: populate hint field for unsupported section errors so callers reading
                 // .hint get actionable guidance instead of null
                 let hint = if matches!(other, "list" | "show" | "help" | "info") {
                     format!(
-                        "'claw config {other}' is not a subcommand. To list all config: `claw config`. To inspect a section: `claw config <section>` where section is one of: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents."
+                        "'claw config {other}' is not a subcommand. To list all config: `claw config`. To inspect a section: `claw config <section>` where section is one of: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents, settings."
                     )
                 } else {
                     format!(
-                        "'{other}' is not a config section. Supported: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents."
+                        "'{other}' is not a config section. Supported: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents, settings."
                     )
                 };
                 return Ok(serde_json::json!({
@@ -8324,9 +8572,9 @@ fn render_config_json(
                     "error_kind": "unsupported_config_section",
                     "section": other,
                     "ok": false,
-                    "error": format!("Unsupported config section '{other}'. Use: env, hooks, model, plugins, mcp, sandbox, permissions, skills, or agents."),
+                    "error": format!("Unsupported config section '{other}'. Use: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents, or settings."),
                     "hint": hint,
-                    "supported_sections": ["env", "hooks", "model", "plugins", "mcp", "sandbox", "permissions", "skills", "agents"],
+                    "supported_sections": ["env", "hooks", "model", "plugins", "mcp", "sandbox", "permissions", "skills", "agents", "settings"],
                     "cwd": cwd.display().to_string(),
                     "loaded_files": loaded_paths.len(),
                     "files": files,
@@ -13476,6 +13724,11 @@ mod tests {
             classify_error_kind("unknown_option: unknown system-prompt option: --foo."),
             "unknown_option"
         );
+        // #830: known command with missing required argument must not collapse to unknown.
+        assert_eq!(
+            classify_error_kind("missing_argument: mcp show requires a server name."),
+            "missing_argument"
+        );
     }
 
     #[test]
@@ -14647,6 +14900,7 @@ mod tests {
                 },
                 boot_preflight: test_boot_preflight(),
                 sandbox_status: runtime::SandboxStatus::default(),
+                binary_provenance: super::binary_provenance_for(None),
                 config_load_error: None,
                 config_load_error_kind: None,
             },
@@ -14792,6 +15046,7 @@ mod tests {
             },
             boot_preflight: test_boot_preflight(),
             sandbox_status: runtime::SandboxStatus::default(),
+            binary_provenance: super::binary_provenance_for(None),
             config_load_error: None,
             config_load_error_kind: None,
         };
@@ -14830,6 +15085,7 @@ mod tests {
             },
             boot_preflight: test_boot_preflight(),
             sandbox_status: runtime::SandboxStatus::default(),
+            binary_provenance: super::binary_provenance_for(None),
             config_load_error: None,
             config_load_error_kind: None,
         };
