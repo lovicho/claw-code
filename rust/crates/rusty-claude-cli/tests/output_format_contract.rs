@@ -1476,7 +1476,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .is_some_and(|available| available.iter().any(|name| name == "web_fetch")));
 
     let checks = doctor["checks"].as_array().expect("doctor checks");
-    assert_eq!(checks.len(), 11);
+    assert_eq!(checks.len(), 12);
     let check_names = checks
         .iter()
         .map(|check| {
@@ -1496,6 +1496,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         check_names,
         vec![
             "auth",
+            "base urls",
             "config",
             "mcp validation",
             "hook validation",
@@ -3884,7 +3885,7 @@ fn agents_plugins_mcp_unknown_subcommand_have_hint_774() {
         };
         let parsed: serde_json::Value =
             serde_json::from_str(json_str.trim()).expect("mcp bogus should emit JSON");
-        assert_eq!(parsed["error_kind"], "unknown_mcp_action");
+        assert_eq!(parsed["error_kind"], "unsupported_action");
         let hint = parsed["hint"].as_str().unwrap_or("");
         assert!(!hint.is_empty(), "mcp bogus hint must be non-null (#774)");
     }

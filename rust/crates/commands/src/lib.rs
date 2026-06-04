@@ -3308,7 +3308,15 @@ fn render_mcp_report_json_for(
                 "use `claw mcp show <server>` to inspect a server",
             ))
         }
-        Some(args) => Ok(render_mcp_usage_json(Some(args))),
+        Some(args) => {
+            // #681: unsupported mutation verbs (add, remove, delete, enable, disable)
+            // and other unknown sub-actions return a typed error instead of help with exit 0.
+            let verb = args.split_whitespace().next().unwrap_or(args);
+            Ok(render_mcp_unsupported_action_json(
+                args,
+                &format!("`{verb}` is not a supported MCP sub-action; supported actions: list, show, help"),
+            ))
+        }
     }
 }
 
@@ -4484,10 +4492,12 @@ fn render_skills_report_json_with_action(collection: &SkillCollection, action: &
         .count();
     let has_drift = !metadata_drift.is_empty();
     let status = if has_drift { "degraded" } else { "ok" };
+    // #410: add `count` field for polymorphic consumption parity with agents list
     json!({
         "kind": "skills",
         "status": status,
         "action": action,
+        "count": skills.len(),
         "valid_count": skills.len(),
         "metadata_drift_count": metadata_drift.len(),
         "summary": {
@@ -4676,6 +4686,7 @@ fn render_mcp_summary_report_json(cwd: &Path, mcp: &McpConfigCollection) -> Valu
     json!({
         "kind": "mcp",
         "action": "list",
+        "count": mcp.valid_count(),
         "working_directory": cwd.display().to_string(),
         "configured_servers": mcp.valid_count(),
         "total_configured": mcp.total_configured(),
@@ -4861,7 +4872,7 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
             "direct_cli": "claw agents [list|show <name>|create <name>|help]",
             "format": "toml",
             "create": "claw agents create <name>",
-            "sources": [".claw/agents", "~/.claw/agents", "$CLAW_CONFIG_HOME/agents"],
+            "sources": [".claw/agents", "~/.claw/agents", "~/.codex/agents", "$CLAW_CONFIG_HOME/agents"],
         },
         "unexpected": unexpected,
     })
@@ -4991,7 +5002,7 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "usage": {
             "slash_command": "/mcp [list|show <server>|help]",
             "direct_cli": "claw mcp [list|show <server>|help]",
-            "sources": [".claw/settings.json", ".claw/settings.local.json"],
+            "sources": [".claw.json", ".claw/settings.json", ".claw/settings.local.json"],
         },
         "unexpected": unexpected,
     })
@@ -6862,7 +6873,7 @@ mod tests {
         let help =
             render_mcp_report_json_for(&loader, &workspace, Some("help")).expect("mcp help json");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["sources"][0], ".claw/settings.json");
+        assert_eq!(help["usage"]["sources"][0], ".claw.json");
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);

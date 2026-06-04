@@ -1092,6 +1092,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_acp_status(output_format)?;
             std::process::exit(2);
         }
+        CliAction::SessionList { output_format } => run_session_list(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         // #146: dispatch pure-local introspection. Text mode uses existing
@@ -1189,6 +1190,9 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Version {
+        output_format: CliOutputFormat,
+    },
+    SessionList {
         output_format: CliOutputFormat,
     },
     ResumeSession {
@@ -1342,9 +1346,28 @@ impl Default for OutputFormatSelection {
 }
 
 static OUTPUT_FORMAT_SELECTION: OnceLock<Mutex<OutputFormatSelection>> = OnceLock::new();
+// #468: duplicate global flag occurrences for provenance reporting
+static DUPLICATE_FLAGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 fn output_format_selection_cell() -> &'static Mutex<OutputFormatSelection> {
     OUTPUT_FORMAT_SELECTION.get_or_init(|| Mutex::new(OutputFormatSelection::default()))
+}
+
+fn duplicate_flags_cell() -> &'static Mutex<Vec<String>> {
+    DUPLICATE_FLAGS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn push_duplicate_flag(flag: &str) {
+    if let Ok(mut flags) = duplicate_flags_cell().lock() {
+        flags.push(flag.to_string());
+    }
+}
+
+fn take_duplicate_flags() -> Vec<String> {
+    duplicate_flags_cell()
+        .lock()
+        .map(|mut flags| std::mem::take(&mut *flags))
+        .unwrap_or_default()
 }
 
 fn set_current_output_format_selection(selection: &OutputFormatSelection) {
@@ -1467,6 +1490,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
+
     // #755: -p prompt text captured as single token; remaining args continue
     // flag parsing. None until `-p <text>` is seen.
     let mut short_p_prompt: Option<String> = None;
@@ -1503,6 +1527,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing_flag_value: missing value for --model.\nUsage: --model <provider/model>  e.g. --model anthropic/claude-opus-4-7".to_string())?;
+                // #468: track duplicate --model flags
+                if model_flag_raw.is_some() {
+                    push_duplicate_flag(&format!(
+                        "--model (previous: {}, new: {})",
+                        model_flag_raw.as_deref().unwrap_or(""),
+                        value
+                    ));
+                }
                 let resolved = resolve_model_alias_with_config(value);
                 debug!("Resolved --model '{}' -> '{}'", value, resolved);
                 validate_model_syntax(&resolved)?;
@@ -1510,6 +1542,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 model_flag_raw = Some(value.clone()); // #148
                 index += 2;
             }
+
             flag if flag.starts_with("--model=") => {
                 let value = &flag[8..];
                 let resolved = resolve_model_alias_with_config(value);
@@ -1523,6 +1556,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing_flag_value: missing value for --output-format.\nUsage: --output-format text  or  --output-format json".to_string())?;
+                // #468: track duplicate --output-format flags
+                if output_format != CliOutputFormat::Text
+                    || output_format_selection.format != CliOutputFormat::Text
+                {
+                    push_duplicate_flag("--output-format (overwriting previous value)");
+                }
                 output_format = apply_output_format_flag(&mut output_format_selection, value)?;
                 index += 2;
             }
@@ -1530,9 +1569,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing_flag_value: missing value for --permission-mode.\nUsage: --permission-mode read-only|workspace-write|danger-full-access".to_string())?;
+                // #468: track duplicate --permission-mode flags
+                if permission_mode_override.is_some() {
+                    push_duplicate_flag("--permission-mode (overwriting previous value)");
+                }
                 permission_mode_override = Some(parse_permission_mode_arg(value)?);
                 index += 2;
             }
+
             flag if flag.starts_with("--output-format=") => {
                 output_format =
                     apply_output_format_flag(&mut output_format_selection, &flag[16..])?;
@@ -1640,6 +1684,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--resume" if rest.is_empty() => {
                 rest.push("--resume".to_string());
+                index += 1;
+            }
+            // #457: --help after --resume should show resume help, not be consumed as session-id
+            "--help" | "-h" if rest.first().map(String::as_str) == Some("--resume") => {
+                wants_help = true;
                 index += 1;
             }
             flag if rest.is_empty() && flag.starts_with("--resume=") => {
@@ -1946,10 +1995,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // had no match arm, and fell to CliAction::Prompt — reaching the credential gate
         // instead of a structured error. Mirror the guard on `permissions`.
         "session" => {
-            let action_hint = rest.get(1).map_or(String::new(), |a| format!(" (got: `{a}`)" ));
-            Err(format!(
-                "interactive_only: `claw session` is a slash command{action_hint}.\nUse `claw --resume SESSION.jsonl /session <action>` or start `claw` and run `/session [list|exists|switch|fork|delete]`."
-            ))
+            // #449: `claw session list` is a pure local filesystem read that
+            // requires no API credentials. Route directly to SessionList instead
+            // of falling through to the resume/auth path.
+            if rest.get(1).map(|s| s.as_str()) == Some("list") {
+                Ok(CliAction::SessionList { output_format })
+            } else {
+                let action_hint = rest.get(1).map_or(String::new(), |a| format!(" (got: `{a}`)" ));
+                Err(format!(
+                    "interactive_only: `claw session` is a slash command{action_hint}.\nUse `claw --resume SESSION.jsonl /session <action>` or start `claw` and run `/session [list|exists|switch|fork|delete]`."
+                ))
+            }
         }
         // #770: same fallthrough gap as #767 — these slash commands had no multi-arg match arm
         // and fell to CliAction::Prompt reaching the credential gate when called with args.
@@ -2334,7 +2390,17 @@ fn parse_single_word_command_alias(
         return Some(Ok(CliAction::Help { output_format }));
     }
 
-    if rest.len() != 1 {
+    // #453: fire guard for multi-word CLI subcommands too (claw cost list, claw model list, etc.)
+    // For slash commands that are commonly used as prompts (explain, cost, tokens, etc.),
+    // only fire the guard when there's exactly one token.
+    if rest.is_empty() {
+        return None;
+    }
+    // Known CLI subcommands that don't accept additional arguments
+    const CLI_SUBCOMMANDS: &[&str] = &[
+        "help", "version", "status", "sandbox", "doctor", "state", "config", "diff",
+    ];
+    if rest.len() > 1 && !CLI_SUBCOMMANDS.contains(&rest[0].as_str()) {
         return None;
     }
 
@@ -2660,6 +2726,7 @@ fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
         "init",
         "export",
         "prompt",
+        "list",
     ];
 
     let normalized_input = input.to_ascii_lowercase();
@@ -3064,6 +3131,17 @@ fn parse_system_prompt_args(
                     "missing_flag_value: missing value for --cwd.\nUsage: --cwd <path>".to_string()
                 })?;
                 cwd = PathBuf::from(value);
+                // #99: validate --cwd path exists and is a directory
+                if !cwd.exists() {
+                    return Err(format!(
+                        "invalid_cwd: path '{value}' does not exist.\nUsage: claw system-prompt --cwd <existing-directory>"
+                    ));
+                }
+                if !cwd.is_dir() {
+                    return Err(format!(
+                        "invalid_cwd: path '{value}' is not a directory.\nUsage: claw system-prompt --cwd <existing-directory>"
+                    ));
+                }
                 index += 2;
             }
             "--date" => {
@@ -3071,9 +3149,22 @@ fn parse_system_prompt_args(
                     "missing_flag_value: missing value for --date.\nUsage: --date <YYYY-MM-DD>"
                         .to_string()
                 })?;
+                // #99: validate --date is a plausible date string (no newlines, reasonable length)
+                if value.contains('\n') || value.contains('\r') {
+                    return Err(format!(
+                        "invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>"
+                    ));
+                }
+                if value.len() > 20 {
+                    return Err(format!(
+                        "invalid_flag_value: --date value is too long ({len} chars, expected YYYY-MM-DD).\nUsage: --date <YYYY-MM-DD>",
+                        len = value.len()
+                    ));
+                }
                 date.clone_from(value);
                 index += 2;
             }
+
             other => {
                 // #152: hint `--output-format json` when user types `--json`.
                 // #790: use unknown_option: prefix + \n hint so classify_error_kind returns
@@ -3551,11 +3642,14 @@ fn render_doctor_report(
         config_load_error: config.as_ref().err().map(ToString::to_string),
         config_load_error_kind: None,
         mcp_validation: mcp_validation.clone(),
+
         hook_validation: hook_validation.clone(),
+        duplicate_flags: Vec::new(),
     };
     Ok(DoctorReport {
         checks: vec![
             check_auth_health(),
+            check_base_url_health(),
             check_config_health(&config_loader, config.as_ref()),
             check_mcp_validation_health(&mcp_validation),
             check_hook_validation_health(&hook_validation),
@@ -3679,6 +3773,7 @@ fn check_auth_health() -> DiagnosticCheck {
         .ok()
         .is_some_and(|value| !value.trim().is_empty());
     let any_auth_present = api_key_present || auth_token_present || openai_key_present;
+    let prompt_ready = any_auth_present;
     let env_details = format!(
         "Environment       api_key={} auth_token={} openai_key={}",
         if api_key_present { "present" } else { "absent" },
@@ -3733,6 +3828,10 @@ fn check_auth_health() -> DiagnosticCheck {
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("openai_key_present".to_string(), json!(openai_key_present)),
+            ("prompt_ready".to_string(), json!(prompt_ready)),
+            ("prompt_blocked_reason".to_string(), if prompt_ready { Value::Null } else { json!("auth_missing") }),
+
             ("legacy_saved_oauth_present".to_string(), json!(true)),
             (
                 "legacy_saved_oauth_expires_at".to_string(),
@@ -3762,6 +3861,9 @@ fn check_auth_health() -> DiagnosticCheck {
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("openai_key_present".to_string(), json!(openai_key_present)),
+            ("prompt_ready".to_string(), json!(prompt_ready)),
+            ("prompt_blocked_reason".to_string(), if prompt_ready { Value::Null } else { json!("auth_missing") }),
             ("legacy_saved_oauth_present".to_string(), json!(false)),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), json!(false)),
@@ -3776,12 +3878,59 @@ fn check_auth_health() -> DiagnosticCheck {
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("openai_key_present".to_string(), json!(openai_key_present)),
+            ("prompt_ready".to_string(), json!(prompt_ready)),
+            ("prompt_blocked_reason".to_string(), if prompt_ready { Value::Null } else { json!("auth_missing") }),
             ("legacy_saved_oauth_present".to_string(), Value::Null),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), Value::Null),
             ("legacy_scopes".to_string(), Value::Null),
             ("legacy_saved_oauth_error".to_string(), json!(error.to_string())),
         ])),
+    }
+}
+
+/// #466: validate provider BASE_URL env vars
+fn check_base_url_health() -> DiagnosticCheck {
+    let base_url_vars = [
+        ("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+        ("OPENAI_BASE_URL", "https://api.openai.com"),
+        ("XAI_BASE_URL", "https://api.x.ai"),
+        ("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com"),
+    ];
+    let mut issues: Vec<String> = Vec::new();
+    let mut details: Vec<String> = Vec::new();
+    for (var_name, default_url) in &base_url_vars {
+        if let Ok(value) = env::var(var_name) {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                issues.push(format!("{var_name} is empty"));
+                details.push(format!(
+                    "{var_name}  empty (will use default: {default_url})"
+                ));
+            } else if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                issues.push(format!("{var_name}={trimmed} is not a valid HTTP(S) URL"));
+                details.push(format!("{var_name}  invalid ({trimmed})"));
+            } else {
+                details.push(format!("{var_name}  {trimmed}"));
+            }
+        }
+    }
+    if issues.is_empty() {
+        DiagnosticCheck::new(
+            "Base URLs",
+            DiagnosticLevel::Ok,
+            "provider base URL env vars are valid or unset",
+        )
+        .with_details(details)
+    } else {
+        DiagnosticCheck::new(
+            "Base URLs",
+            DiagnosticLevel::Warn,
+            format!("{} base URL issue(s) found", issues.len()),
+        )
+        .with_details(details)
+        .with_hint("Fix the reported BASE_URL env vars or unset them to use provider defaults.")
     }
 }
 
@@ -4659,6 +4808,16 @@ fn print_system_prompt(
 
 ",
     );
+    // #418: filter out the internal boundary sentinel from the sections array
+    // and expose the boundary index as a structured field.
+    let filtered_sections: Vec<&str> = sections
+        .iter()
+        .filter(|s| !s.contains("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"))
+        .map(|s| s.as_str())
+        .collect();
+    let boundary_index = sections
+        .iter()
+        .position(|s| s.contains("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"));
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
         CliOutputFormat::Json => println!(
@@ -4668,7 +4827,8 @@ fn print_system_prompt(
                 "action": "show",
                 "status": "ok",
                 "message": message,
-                "sections": sections,
+                "sections": filtered_sections,
+                "boundary_index": boundary_index,
                 "memory_file_count": memory_files.len(),
                 "memory_files": memory_files_json(&memory_files),
             }))?
@@ -5181,7 +5341,10 @@ struct StatusContext {
     /// instead of regex-scraping the prose.
     config_load_error_kind: Option<&'static str>,
     mcp_validation: McpValidationSummary,
+
     hook_validation: HookValidationSummary,
+    /// #468: duplicate global flag occurrences for provenance reporting
+    duplicate_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6110,7 +6273,7 @@ fn run_resume_command(
             session: session.clone(),
             message: Some(render_repl_help()),
             json: Some(
-                serde_json::json!({ "kind": "help", "action": "help", "status": "ok", "text": render_repl_help() }),
+                serde_json::json!({ "kind": "help", "action": "help", "status": "ok", "message": render_repl_help() }),
             ),
         }),
         SlashCommand::Compact => {
@@ -6569,7 +6732,7 @@ fn enforce_broad_cwd_policy(
         );
         match output_format {
             CliOutputFormat::Json => {
-                eprintln!(
+                println!(
                     "{}",
                     serde_json::json!({
                         "kind": "broad_cwd",
@@ -8923,6 +9086,34 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
     Ok(lines.join("\n"))
 }
 
+/// #449: credentials-free session list that works without API keys.
+/// `claw session list --output-format json` should work in CI/offline.
+fn run_session_list(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let sessions = list_managed_sessions().unwrap_or_default();
+    let session_ids: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
+    let session_details = session_details_json(&sessions);
+    match output_format {
+        CliOutputFormat::Text => {
+            let text = render_session_list("").unwrap_or_else(|e| format!("error: {e}"));
+            println!("{text}");
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "kind": "sessions",
+                    "status": "ok",
+                    "action": "list",
+                    "sessions": session_ids,
+                    "session_details": session_details,
+                    "active": serde_json::Value::Null,
+                })
+            );
+        }
+    }
+    Ok(())
+}
+
 fn format_session_modified_age(modified_epoch_millis: u128) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -9099,6 +9290,8 @@ fn status_json_value(
         "config_load_error_kind": context.config_load_error_kind,
         "mcp_validation": context.mcp_validation.json_value(),
         "hook_validation": context.hook_validation.json_value(),
+        "duplicate_flags": context.duplicate_flags,
+
         "model": model,
         "model_source": model_source,
         "model_raw": model_raw,
@@ -9147,8 +9340,11 @@ fn status_json_value(
             "project_root": context.project_root,
             "git_branch": context.git_branch,
             "git_state": context.git_summary.headline(),
+            // #408: changed_files counts ALL non-clean files (staged + unstaged + untracked + conflicted)
             "changed_files": context.git_summary.changed_files,
+            "is_clean": context.git_summary.changed_files == 0,
             "staged_files": context.git_summary.staged_files,
+
             "unstaged_files": context.git_summary.unstaged_files,
             "untracked_files": context.git_summary.untracked_files,
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
@@ -9191,7 +9387,8 @@ fn status_context(
 ) -> Result<StatusContext, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
-    let discovered_config_files = loader.discover().len();
+    // #456: count only paths that exist on disk, matching check_config_health behavior.
+    let discovered_config_files = loader.discover().iter().filter(|e| e.path.exists()).count();
     // #143: degrade gracefully on config parse failure rather than hard-fail.
     // `claw doctor` already does this; `claw status` now matches that contract
     // so that one malformed `mcpServers.*` entry doesn't take down the whole
@@ -9274,7 +9471,9 @@ fn status_context(
         config_load_error,
         config_load_error_kind,
         mcp_validation,
+
         hook_validation,
+        duplicate_flags: take_duplicate_flags(),
     })
 }
 
@@ -9534,6 +9733,7 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
         "action": "status",
         "status": top_status,
         "enabled": status.enabled,
+        "requested": status.enabled,
         "active": status.active,
         "supported": status.supported,
         "in_container": status.in_container,
@@ -9546,6 +9746,11 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
         "allowed_mounts": status.allowed_mounts,
         "markers": status.container_markers,
         "fallback_reason": status.fallback_reason,
+        "active_components": {
+            "namespace": status.namespace_active,
+            "network": status.network_active,
+            "filesystem": status.filesystem_active,
+        },
     })
 }
 
@@ -9878,6 +10083,82 @@ fn render_doctor_help_json() -> serde_json::Value {
     })
 }
 
+/// #683-#692: extract structured metadata from help prose
+fn extract_help_metadata(
+    topic: LocalHelpTopic,
+) -> (
+    Option<String>,      // usage
+    Option<String>,      // purpose
+    Option<String>,      // output description
+    Option<Vec<String>>, // formats
+    Option<Vec<String>>, // related
+    Option<Vec<String>>, // aliases
+    bool,                // local_only
+    bool,                // requires_credentials
+) {
+    let text = render_help_topic(topic);
+    let mut usage = None;
+    let mut purpose = None;
+    let mut output_desc = None;
+    let formats = Some(vec!["text".to_string(), "json".to_string()]);
+    let mut related = None;
+    let mut aliases = None;
+    let local_only = matches!(
+        topic,
+        LocalHelpTopic::Status
+            | LocalHelpTopic::Sandbox
+            | LocalHelpTopic::Doctor
+            | LocalHelpTopic::Version
+            | LocalHelpTopic::State
+            | LocalHelpTopic::Init
+            | LocalHelpTopic::Export
+            | LocalHelpTopic::SystemPrompt
+            | LocalHelpTopic::DumpManifests
+            | LocalHelpTopic::BootstrapPlan
+    );
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Usage") {
+            let value = rest.trim();
+            if !value.is_empty() {
+                usage = Some(value.to_string());
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("Purpose") {
+            purpose = Some(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("Output") {
+            output_desc = Some(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("Aliases") {
+            let parts: Vec<String> = rest
+                .split('·')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parts.is_empty() {
+                aliases = Some(parts);
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("Related") {
+            let parts: Vec<String> = rest
+                .split('·')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parts.is_empty() {
+                related = Some(parts);
+            }
+        }
+    }
+    (
+        usage,
+        purpose,
+        output_desc,
+        formats,
+        related,
+        aliases,
+        local_only,
+        !local_only,
+    )
+}
+
 fn render_help_topic_json(topic: LocalHelpTopic) -> serde_json::Value {
     if topic == LocalHelpTopic::Export {
         return render_export_help_json();
@@ -9886,14 +10167,30 @@ fn render_help_topic_json(topic: LocalHelpTopic) -> serde_json::Value {
         return render_doctor_help_json();
     }
 
-    json!({
+    // #683-#692: extract structured metadata from help prose for machine consumption
+    let (usage, purpose, output_desc, formats, related, aliases, local_only, requires_credentials) =
+        extract_help_metadata(topic);
+    let mut obj = serde_json::json!({
         "kind": "help",
         "action": "help",
         "status": "ok",
         "topic": local_help_topic_command(topic),
         "command": local_help_topic_command(topic),
         "message": render_help_topic(topic),
-    })
+        "usage": usage,
+        "purpose": purpose,
+        "formats": formats,
+        "related": related,
+        "local_only": local_only,
+        "requires_credentials": requires_credentials,
+    });
+    if let Some(desc) = output_desc {
+        obj["output_fields"] = serde_json::Value::String(desc);
+    }
+    if let Some(a) = aliases {
+        obj["aliases"] = serde_json::json!(a);
+    }
+    obj
 }
 
 fn print_help_topic(
@@ -10089,6 +10386,12 @@ fn render_config_json(
         .unwrap_or_else(runtime::RuntimeConfig::empty);
     let loaded_files = runtime_config.loaded_entries().len();
     let merged_keys = runtime_config.merged().len();
+    // #415: expose actual merged key-value pairs, not just count
+    let merged_json_str = serde_json::json!(runtime_config
+        .merged()
+        .iter()
+        .map(|(k, v)| { (k.clone(), serde_json::Value::String(v.render())) })
+        .collect::<serde_json::Map<String, serde_json::Value>>());
     let files: Vec<_> = inspection
         .files
         .iter()
@@ -10118,7 +10421,9 @@ fn render_config_json(
         "loaded_files": loaded_files,
         "merged_keys": merged_keys,
         "merged_key_count": merged_keys,
+        "merged": merged_json_str,
         "merged_keys_meaning": "count of top-level keys in the effective merged JSON object",
+
         "files": files,
         "warnings": warnings_json,
         "load_error": inspection.load_error.clone(),
@@ -16869,7 +17174,9 @@ mod tests {
                 config_load_error: None,
                 config_load_error_kind: None,
                 mcp_validation: super::McpValidationSummary::default(),
+
                 hook_validation: super::HookValidationSummary::default(),
+                duplicate_flags: Vec::new(),
             },
             None, // #148
             None,
@@ -17021,7 +17328,9 @@ mod tests {
             config_load_error: None,
             config_load_error_kind: None,
             mcp_validation: super::McpValidationSummary::default(),
+
             hook_validation: super::HookValidationSummary::default(),
+            duplicate_flags: Vec::new(),
         };
 
         let check = super::check_workspace_health(&context);
@@ -17072,7 +17381,9 @@ mod tests {
             config_load_error: None,
             config_load_error_kind: None,
             mcp_validation: super::McpValidationSummary::default(),
+
             hook_validation: super::HookValidationSummary::default(),
+            duplicate_flags: Vec::new(),
         };
 
         let check = super::check_memory_health(&context);
@@ -17115,7 +17426,9 @@ mod tests {
             config_load_error: None,
             config_load_error_kind: None,
             mcp_validation: super::McpValidationSummary::default(),
+
             hook_validation: super::HookValidationSummary::default(),
+            duplicate_flags: Vec::new(),
         };
 
         let value = status_json_value(
