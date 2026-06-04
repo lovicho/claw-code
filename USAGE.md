@@ -51,26 +51,27 @@ cd rust
 ```
 
 **Note:** Diagnostic verbs (`doctor`, `status`, `sandbox`, `version`) support `--output-format json` for machine-readable output. Invalid suffix arguments (e.g., `--json`) are now rejected at parse time rather than falling through to prompt dispatch.
+`version --output-format json` reports structured build provenance including full `git_sha`, derived `git_sha_short`, `is_dirty`, `branch`, `commit_date`, `commit_timestamp`, `rustc_version`, runtime `executable_path`, and `binary_provenance`; JSON keeps the prose report in `human_readable` instead of duplicating it under `message`. `status --output-format json` exposes `workspace.memory_files[]` with `path`, `source`, `origin`, `scope_path`, `outside_project`, `chars`, and `contributes` for every loaded project memory file.
 
 ### Initialize a repository
 
-Set up a new repository with `.claw` config, `.claw.json`, `.gitignore` entries, and a `CLAUDE.md` guidance file:
+Set up a new repository with `.claw/settings.json`, `.claw.json`, `.gitignore` entries, and a `CLAUDE.md` guidance file:
 
 ```bash
 cd /path/to/your/repo
 ./target/debug/claw init
 ```
 
-Text mode (human-readable) shows artifact creation summary with project path and next steps. Idempotent — running multiple times in the same repo marks already-created files as "skipped".
+Text mode (human-readable) shows artifact creation summary with project path and next steps. Idempotent — running multiple times in the same repo marks already-created files as "skipped", reports `.claw/` as "partial" when missing sub-files are materialized, and keeps `.claw/sessions/` deferred until the first successful session save.
 
 JSON mode for scripting:
 ```bash
 ./target/debug/claw init --output-format json
 ```
 
-Returns structured output with `project_path`, `created[]`, `updated[]`, `skipped[]` arrays (one per artifact), and `artifacts[]` carrying each file's `name` and machine-stable `status` tag. The legacy `message` field preserves backward compatibility.
+Returns structured output with `project_path`, `created[]`, `updated[]`, `partial[]`, `deferred[]`, and `skipped[]` arrays (one per artifact status), and `artifacts[]` carrying each file's `name` and machine-stable `status` tag. The legacy `message` field preserves backward compatibility.
 
-**Why structured fields matter:** Claws can detect per-artifact state (`created` vs `updated` vs `skipped`) without substring-matching human prose. Use the `created[]`, `updated[]`, and `skipped[]` arrays for conditional follow-up logic (e.g., only commit if files were actually created, not just updated).
+**Why structured fields matter:** Claws can detect per-artifact state (`created`, `updated`, `partial`, `deferred`, or `skipped`) without substring-matching human prose. Use the status arrays for conditional follow-up logic (e.g., only commit if files were actually created, not just updated).
 
 ### Interactive REPL
 
@@ -569,6 +570,30 @@ Runtime config is loaded in this order, with later entries overriding earlier on
 
 The list is also the precedence chain: project-local settings override project settings, project settings override the legacy project `.claw.json`, and project files override user files. `claw --output-format json config` includes each discovered file's `precedence_rank`, `wins_for_keys`, and `shadowed_keys` so automation can see which file controls each effective key without reimplementing the merge order.
 
+## MCP server validation
+
+`claw mcp --output-format json` loads valid `mcpServers` entries even when sibling entries are malformed. The JSON list envelope distinguishes the total configured entries from the valid and invalid subsets:
+
+```json
+{
+  "configured_servers": 1,
+  "total_configured": 2,
+  "valid_count": 1,
+  "invalid_count": 1,
+  "servers": [{ "name": "valid-server", "valid": true }],
+  "invalid_servers": [
+    {
+      "name": "missing-command",
+      "error_field": "command",
+      "reason": ".claw.json: mcpServers.missing-command: missing string field command",
+      "valid": false
+    }
+  ]
+}
+```
+
+`status --output-format json` mirrors this under `mcp_validation`, and `doctor --output-format json` includes an `mcp validation` check so automation can repair every rejected server entry without losing usable MCP servers.
+
 ## Hook configuration
 
 `hooks.PreToolUse`, `hooks.PostToolUse`, and `hooks.PostToolUseFailure` accept either legacy command strings or object-style entries with a `matcher` and nested command hooks:
@@ -593,10 +618,12 @@ Object-style matchers are optional. When present, they match tool names case-ins
 
 ## Project instruction rules
 
-In addition to root instruction files such as `CLAUDE.md`, `AGENTS.md`, `.claw/CLAUDE.md`, `.claude/CLAUDE.md`, and `.claw/instructions.md`, `claw` loads sorted Markdown/text rule files from:
+In addition to root instruction files such as `CLAUDE.md`, `CLAW.md`, `AGENTS.md`, `.claw/CLAUDE.md`, `.claude/CLAUDE.md`, and `.claw/instructions.md`, `claw` loads sorted Markdown/text rule files from:
 
 - `<repo>/.claw/rules/` (`.md`, `.txt`, `.mdc`) for shared project rules.
 - `<repo>/.claw/rules.local/` for personal local rules; this path is gitignored.
+
+Root instruction-file priority is `CLAUDE.md`, then `CLAW.md`, then `AGENTS.md` for each discovered directory. Discovery is bounded to the current git root when one exists, otherwise to the current directory only, so stale parent files outside the project do not silently bleed into the prompt. All loaded files contribute to the system prompt and to `status --output-format json` as `workspace.memory_files:[{path, source, origin, scope_path, outside_project, chars, contributes}]`; `claw doctor --output-format json` includes a `memory` check so automation can detect loaded and unexpected unloaded memory-file candidates without parsing prompt text.
 
 By default, `claw` also imports detected rules from common AI coding tools such as Cursor (`.cursorrules`, `.cursor/rules/`), GitHub Copilot (`.github/copilot-instructions.md`), Windsurf, Plandex, and Crush. Control this with `rulesImport` in any settings file:
 

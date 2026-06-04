@@ -53,10 +53,11 @@ use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
-    load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
-    ApiClient, ApiRequest, AssistantEvent, BaseCommitState, CompactionConfig, ConfigFileReport,
-    ConfigLoader, ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
-    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
+    load_system_prompt, load_system_prompt_with_context, pricing_for_model, resolve_expected_base,
+    resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, BaseCommitState,
+    CompactionConfig, ConfigFileReport, ConfigLoader, ConfigSource, ContentBlock, ContextFile,
+    ConversationMessage, ConversationRuntime, McpConfigCollection, McpInvalidServerConfig,
+    McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
     PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
@@ -268,6 +269,12 @@ const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
+const GIT_SHA_SHORT: Option<&str> = option_env!("GIT_SHA_SHORT");
+const GIT_DIRTY: Option<&str> = option_env!("GIT_DIRTY");
+const GIT_BRANCH: Option<&str> = option_env!("GIT_BRANCH");
+const GIT_COMMIT_DATE: Option<&str> = option_env!("GIT_COMMIT_DATE");
+const GIT_COMMIT_TIMESTAMP: Option<&str> = option_env!("GIT_COMMIT_TIMESTAMP");
+const RUSTC_VERSION: Option<&str> = option_env!("RUSTC_VERSION");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
@@ -382,9 +389,16 @@ fn main() {
                     object.insert("available".to_string(), serde_json::json!(available));
                     object.insert("tool_aliases".to_string(), aliases);
                 }
-            } else if kind == "missing_argument" && message.contains("--allowedTools") {
+            } else if kind == "missing_argument" {
                 if let Some(object) = error_json.as_object_mut() {
-                    object.insert("argument".to_string(), serde_json::json!("--allowedTools"));
+                    if message.contains("--allowedTools") {
+                        object.insert("argument".to_string(), serde_json::json!("--allowedTools"));
+                    } else if message.contains("prompt or subcommand") {
+                        object.insert(
+                            "argument".to_string(),
+                            serde_json::json!("prompt or subcommand"),
+                        );
+                    }
                 }
             }
             // #819/#820/#823: JSON mode error envelopes must go to stdout so machine
@@ -1565,8 +1579,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "--" => {
-                positional_after_separator = true;
-                rest.extend(args[index + 1..].iter().cloned());
+                if rest.is_empty() {
+                    positional_after_separator = true;
+                    rest.extend(args[index + 1..].iter().cloned());
+                } else {
+                    rest.push("--".to_string());
+                    rest.extend(args[index + 1..].iter().cloned());
+                }
                 break;
             }
             "-p" => {
@@ -1746,11 +1765,15 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+        let stdin_is_terminal = std::io::stdin().is_terminal();
+        if compact && stdin_is_terminal {
+            return Err(compact_missing_argument_error());
+        }
         // When stdin is not a terminal (pipe/redirect) and no prompt is given on the
         // command line, read stdin as the prompt and dispatch as a one-shot Prompt
         // rather than starting the interactive REPL (which would consume the pipe and
         // print the startup banner, then exit without sending anything to the API).
-        if !std::io::stdin().is_terminal() {
+        if !stdin_is_terminal {
             let mut buf = String::new();
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
             let piped = buf.trim().to_string();
@@ -1761,11 +1784,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     allowed_tools,
                     permission_mode,
                     output_format,
-                    compact: false,
+                    compact,
                     base_commit,
                     reasoning_effort,
                     allow_broad_cwd,
                 });
+            }
+            if compact {
+                return Err(compact_missing_argument_error());
             }
             // Non-TTY stdin with no piped content: refuse to start the interactive
             // REPL (it would block forever waiting for input that will never arrive).
@@ -2082,7 +2108,12 @@ Usage: claw prompt <text>  or  echo '<text>' | claw prompt".to_string());
             allow_broad_cwd,
         ),
         other => {
-            if !other.starts_with('-') && looks_like_subcommand_typo(other) && rest.len() == 1 {
+            if !compact
+                && !other.starts_with('-')
+                && looks_like_subcommand_typo(other)
+                && (rest.len() == 1
+                    || (output_format == CliOutputFormat::Json && model_flag_raw.is_none()))
+            {
                 // #825/#826: emit command_not_found before provider startup for
                 // command-shaped tokens that do not match known subcommands.
                 // Text-mode multi-word prompt shorthand remains available, but
@@ -2431,10 +2462,13 @@ fn parse_direct_slash_cli_action(
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
         Ok(Some(SlashCommand::Help)) => Ok(CliAction::Help { output_format }),
-        Ok(Some(SlashCommand::Status)) => Err(
-            "interactive_only: /status requires a live session.\nStart `claw` and run it there, or use `claw --resume SESSION.jsonl /status` / `claw --resume latest /status`."
-                .to_string(),
-        ),
+        Ok(Some(SlashCommand::Status)) => Ok(CliAction::Status {
+            model,
+            model_flag_raw: None,
+            permission_mode,
+            output_format,
+            allowed_tools,
+        }),
         Ok(Some(SlashCommand::Sandbox)) => Ok(CliAction::Sandbox { output_format }),
         Ok(Some(SlashCommand::Diff)) => Ok(CliAction::Diff { output_format }),
         Ok(Some(SlashCommand::Version)) => Ok(CliAction::Version { output_format }),
@@ -2836,6 +2870,11 @@ fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, 
 
 fn allowed_tools_missing_error() -> String {
     "missing_argument: --allowedTools requires a tool list before subcommands or flags.\nUsage: --allowedTools <tool-name>[,<tool-name>...]  e.g. --allowedTools read,glob".to_string()
+}
+
+fn compact_missing_argument_error() -> String {
+    "missing_argument: --compact requires prompt text, piped stdin, or a subcommand. argument: prompt or subcommand\nUsage: claw --compact <prompt>  or  echo '<prompt>' | claw --compact"
+        .to_string()
 }
 
 fn allowed_tool_aliases_json(registry: &GlobalToolRegistry) -> Value {
@@ -3454,6 +3493,16 @@ fn render_doctor_report(
         config.as_ref().ok(),
         config.as_ref().err().map(ToString::to_string).as_deref(),
     );
+    let memory_files = memory_file_summaries_for(
+        &cwd,
+        project_root.as_deref(),
+        &project_context.instruction_files,
+    );
+    let mcp_validation = config
+        .as_ref()
+        .ok()
+        .map(|runtime_config| McpValidationSummary::from_collection(runtime_config.mcp()))
+        .unwrap_or_default();
     let context = StatusContext {
         cwd: cwd.clone(),
         session_path: None,
@@ -3463,6 +3512,12 @@ fn render_doctor_report(
             .map_or(0, |runtime_config| runtime_config.loaded_entries().len()),
         discovered_config_files: discovered_config.len(),
         memory_file_count: project_context.instruction_files.len(),
+        memory_files: memory_files.clone(),
+        unloaded_memory_files: unloaded_memory_candidates(
+            &cwd,
+            project_root.as_deref(),
+            &memory_files,
+        ),
         project_root,
         git_branch,
         git_summary,
@@ -3476,13 +3531,16 @@ fn render_doctor_report(
         // fed into health renderers that don't read config_load_error.
         config_load_error: config.as_ref().err().map(ToString::to_string),
         config_load_error_kind: None,
+        mcp_validation: mcp_validation.clone(),
     };
     Ok(DoctorReport {
         checks: vec![
             check_auth_health(),
             check_config_health(&config_loader, config.as_ref()),
+            check_mcp_validation_health(&mcp_validation),
             check_install_source_health(),
             check_workspace_health(&context),
+            check_memory_health(&context),
             check_boot_preflight_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_permission_health(permission_mode),
@@ -3740,8 +3798,14 @@ fn check_config_health(
             }
             details.push(format!(
                 "MCP servers       {}",
-                runtime_config.mcp().servers().len()
+                runtime_config.mcp().valid_count()
             ));
+            if runtime_config.mcp().invalid_count() > 0 {
+                details.push(format!(
+                    "MCP invalid       {}",
+                    runtime_config.mcp().invalid_count()
+                ));
+            }
             if present_paths.is_empty() {
                 details.push("Discovered files  <none> (defaults active)".to_string());
             } else {
@@ -3768,7 +3832,11 @@ fn check_config_health(
                 ("resolved_model".to_string(), json!(runtime_config.model())),
                 (
                     "mcp_servers".to_string(),
-                    json!(runtime_config.mcp().servers().len()),
+                    json!(runtime_config.mcp().valid_count()),
+                ),
+                (
+                    "mcp_invalid_servers".to_string(),
+                    json!(runtime_config.mcp().invalid_count()),
                 ),
             ]))
         }
@@ -3798,6 +3866,56 @@ fn check_config_health(
             ("load_error".to_string(), json!(error.to_string())),
         ])),
     }
+}
+
+fn check_mcp_validation_health(summary: &McpValidationSummary) -> DiagnosticCheck {
+    let mut details = vec![
+        format!("Total entries     {}", summary.total_configured),
+        format!("Valid entries     {}", summary.valid_count),
+        format!("Invalid entries   {}", summary.invalid_count()),
+    ];
+    details.extend(
+        summary
+            .invalid_servers
+            .iter()
+            .map(|server| format!("Invalid server   {} ({})", server.name, server.reason)),
+    );
+
+    DiagnosticCheck::new(
+        "MCP validation",
+        if summary.has_invalid_servers() {
+            DiagnosticLevel::Warn
+        } else {
+            DiagnosticLevel::Ok
+        },
+        if summary.has_invalid_servers() {
+            format!(
+                "{} MCP server entries are invalid; {} valid entries remain loaded",
+                summary.invalid_count(),
+                summary.valid_count
+            )
+        } else {
+            format!("{} MCP server entries validated", summary.valid_count)
+        },
+    )
+    .with_hint(if summary.has_invalid_servers() {
+        "Inspect `claw mcp list --output-format json` invalid_servers and fix each rejected mcpServers entry."
+    } else {
+        ""
+    })
+    .with_details(details)
+    .with_data(Map::from_iter([
+        (
+            "total_configured".to_string(),
+            json!(summary.total_configured),
+        ),
+        ("valid_count".to_string(), json!(summary.valid_count)),
+        ("invalid_count".to_string(), json!(summary.invalid_count())),
+        (
+            "invalid_servers".to_string(),
+            Value::Array(invalid_mcp_servers_json(&summary.invalid_servers)),
+        ),
+    ]))
 }
 
 fn check_permission_health(permission_mode: PermissionModeProvenance) -> DiagnosticCheck {
@@ -3938,6 +4056,19 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
             context.memory_file_count, context.loaded_config_files, context.discovered_config_files
         ),
         format!(
+            "Loaded memory    {}",
+            if context.memory_files.is_empty() {
+                "<none>".to_string()
+            } else {
+                context
+                    .memory_files
+                    .iter()
+                    .map(|file| format!("{}:{}", file.source, file.path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ),
+        format!(
             "Stale base      {}",
             stale_base_warning.as_deref().unwrap_or("ok")
         ),
@@ -3966,6 +4097,14 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
             json!(context.memory_file_count),
         ),
         (
+            "memory_files".to_string(),
+            Value::Array(memory_files_json(&context.memory_files)),
+        ),
+        (
+            "unloaded_memory_files".to_string(),
+            json!(context.unloaded_memory_files),
+        ),
+        (
             "loaded_config_files".to_string(),
             json!(context.loaded_config_files),
         ),
@@ -3976,6 +4115,62 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
         (
             "stale_base".to_string(),
             stale_base_json_value(&context.stale_base_state),
+        ),
+    ]))
+}
+
+fn check_memory_health(context: &StatusContext) -> DiagnosticCheck {
+    let has_unloaded = !context.unloaded_memory_files.is_empty();
+    let has_outside_project = context.memory_files.iter().any(|file| file.outside_project);
+    let mut details = vec![format!("Loaded files     {}", context.memory_file_count)];
+    details.extend(context.memory_files.iter().map(|file| {
+        format!(
+            "Loaded          {} ({}, chars={})",
+            file.path, file.source, file.chars
+        )
+    }));
+    details.extend(
+        context
+            .unloaded_memory_files
+            .iter()
+            .map(|path| format!("Unloaded        {path}")),
+    );
+
+    DiagnosticCheck::new(
+        "Memory",
+        if has_unloaded || has_outside_project {
+            DiagnosticLevel::Warn
+        } else {
+            DiagnosticLevel::Ok
+        },
+        if has_outside_project {
+            "memory files outside the current git project are loaded".to_string()
+        } else if has_unloaded {
+            "some workspace memory files exist but were not loaded".to_string()
+        } else {
+            format!("{} workspace memory files loaded", context.memory_file_count)
+        },
+    )
+    .with_hint(if has_outside_project {
+        "Inspect workspace.memory_files in `claw status --output-format json`; move unintended ancestor instructions inside the git project or run from the intended workspace root."
+    } else if has_unloaded {
+        "Move instructions into CLAUDE.md, CLAW.md, or AGENTS.md within the current workspace ancestry, or inspect workspace.memory_files in `claw status --output-format json`."
+    } else {
+        ""
+    })
+    .with_details(details)
+    .with_data(Map::from_iter([
+        (
+            "memory_file_count".to_string(),
+            json!(context.memory_file_count),
+        ),
+        (
+            "memory_files".to_string(),
+            Value::Array(memory_files_json(&context.memory_files)),
+        ),
+        (
+            "unloaded_memory_files".to_string(),
+            json!(context.unloaded_memory_files),
         ),
     ]))
 }
@@ -4375,13 +4570,20 @@ fn print_system_prompt(
     model: &str,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sections = load_system_prompt(
+    let (sections, project_context) = load_system_prompt_with_context(
         cwd,
         date,
         env::consts::OS,
         "unknown",
         model_family_identity_for(model),
     )?;
+    let (project_root, _) =
+        parse_git_status_metadata_for(&project_context.cwd, project_context.git_status.as_deref());
+    let memory_files = memory_file_summaries_for(
+        &project_context.cwd,
+        project_root.as_deref(),
+        &project_context.instruction_files,
+    );
     let message = sections.join(
         "
 
@@ -4397,6 +4599,8 @@ fn print_system_prompt(
                 "status": "ok",
                 "message": message,
                 "sections": sections,
+                "memory_file_count": memory_files.len(),
+                "memory_files": memory_files_json(&memory_files),
             }))?
         ),
     }
@@ -4420,9 +4624,15 @@ fn version_json_value() -> serde_json::Value {
         "kind": "version",
         "action": "show",
         "status": "ok",
-        "message": render_version_report(),
+        "human_readable": render_version_report(),
         "version": VERSION,
         "git_sha": binary_provenance.git_sha,
+        "git_sha_short": binary_provenance.git_sha_short,
+        "is_dirty": binary_provenance.is_dirty,
+        "branch": binary_provenance.branch,
+        "commit_date": binary_provenance.commit_date,
+        "commit_timestamp": binary_provenance.commit_timestamp,
+        "rustc_version": binary_provenance.rustc_version,
         "target": binary_provenance.target,
         "build_date": binary_provenance.build_date,
         "executable_path": binary_provenance.executable_path,
@@ -4628,6 +4838,197 @@ struct ResumeCommandOutcome {
     json: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryFileSummary {
+    path: String,
+    source: String,
+    chars: usize,
+    origin: String,
+    scope_path: String,
+    outside_project: bool,
+    contributes: bool,
+}
+
+impl MemoryFileSummary {
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "path": self.path,
+            "source": self.source,
+            "chars": self.chars,
+            "origin": self.origin,
+            "scope_path": self.scope_path,
+            "outside_project": self.outside_project,
+            "contributes": self.contributes,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct McpValidationSummary {
+    total_configured: usize,
+    valid_count: usize,
+    invalid_servers: Vec<McpInvalidServerConfig>,
+}
+
+impl McpValidationSummary {
+    fn from_collection(collection: &McpConfigCollection) -> Self {
+        Self {
+            total_configured: collection.total_configured(),
+            valid_count: collection.valid_count(),
+            invalid_servers: collection.invalid_servers().to_vec(),
+        }
+    }
+
+    fn invalid_count(&self) -> usize {
+        self.invalid_servers.len()
+    }
+
+    fn has_invalid_servers(&self) -> bool {
+        !self.invalid_servers.is_empty()
+    }
+
+    fn json_value(&self) -> serde_json::Value {
+        json!({
+            "total_configured": self.total_configured,
+            "valid_count": self.valid_count,
+            "invalid_count": self.invalid_count(),
+            "invalid_servers": invalid_mcp_servers_json(&self.invalid_servers),
+        })
+    }
+}
+
+fn invalid_mcp_servers_json(invalid_servers: &[McpInvalidServerConfig]) -> Vec<serde_json::Value> {
+    invalid_servers
+        .iter()
+        .map(|server| {
+            json!({
+                "name": &server.name,
+                "scope": config_source_json_value(server.scope),
+                "path": server.path.display().to_string(),
+                "error_field": &server.error_field,
+                "reason": &server.reason,
+                "valid": false,
+            })
+        })
+        .collect()
+}
+
+fn config_source_json_value(source: ConfigSource) -> serde_json::Value {
+    let id = match source {
+        ConfigSource::User => "user",
+        ConfigSource::Project => "project",
+        ConfigSource::Local => "local",
+    };
+    json!({"id": id, "label": id})
+}
+
+fn memory_file_summaries_for(
+    cwd: &Path,
+    project_root: Option<&Path>,
+    files: &[ContextFile],
+) -> Vec<MemoryFileSummary> {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let project_root =
+        project_root.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    files
+        .iter()
+        .map(|file| {
+            let path = file
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| file.path.clone());
+            let scope_path = memory_scope_path(&path);
+            let origin = memory_origin(&cwd, project_root.as_deref(), &scope_path);
+            let outside_project = project_root
+                .as_ref()
+                .is_some_and(|root| !path.starts_with(root));
+            MemoryFileSummary {
+                path: file.path.display().to_string(),
+                source: file.source().to_string(),
+                origin: origin.to_string(),
+                scope_path: scope_path.display().to_string(),
+                chars: file.char_count(),
+                outside_project,
+                contributes: true,
+            }
+        })
+        .collect()
+}
+
+fn memory_scope_path(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return PathBuf::from(".");
+    };
+    let parent_name = parent.file_name().and_then(|name| name.to_str());
+    if matches!(parent_name, Some(".claw" | ".claude")) {
+        return parent.parent().unwrap_or(parent).to_path_buf();
+    }
+    if matches!(parent_name, Some("rules" | "rules.local")) {
+        if let Some(grandparent) = parent.parent() {
+            if grandparent.file_name().and_then(|name| name.to_str()) == Some(".claw") {
+                return grandparent.parent().unwrap_or(grandparent).to_path_buf();
+            }
+        }
+    }
+    parent.to_path_buf()
+}
+
+fn memory_origin(cwd: &Path, project_root: Option<&Path>, scope_path: &Path) -> &'static str {
+    if scope_path == cwd {
+        return "workspace";
+    }
+    if project_root.is_some_and(|root| !scope_path.starts_with(root)) {
+        return "outside_project";
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        let home = home.canonicalize().unwrap_or(home);
+        if scope_path == home {
+            return "home";
+        }
+    }
+    if cwd.parent().is_some_and(|parent| parent == scope_path) {
+        return "parent_dir";
+    }
+    if cwd.starts_with(scope_path) {
+        return "ancestor";
+    }
+    "workspace"
+}
+
+fn memory_files_json(files: &[MemoryFileSummary]) -> Vec<serde_json::Value> {
+    files.iter().map(MemoryFileSummary::json_value).collect()
+}
+
+fn unloaded_memory_candidates(
+    cwd: &Path,
+    project_root: Option<&Path>,
+    files: &[MemoryFileSummary],
+) -> Vec<String> {
+    let mut loaded = files
+        .iter()
+        .map(|file| PathBuf::from(&file.path))
+        .collect::<Vec<_>>();
+    loaded.sort();
+
+    let boundary = project_root.unwrap_or(cwd);
+    let mut missing = Vec::new();
+    let mut cursor = Some(cwd);
+    while let Some(dir) = cursor {
+        for name in ["CLAW.md", "AGENTS.md"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() && !loaded.iter().any(|path| path == &candidate) {
+                missing.push(candidate.display().to_string());
+            }
+        }
+        if dir == boundary {
+            break;
+        }
+        cursor = dir.parent();
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
 #[derive(Debug, Clone)]
 struct StatusContext {
     cwd: PathBuf,
@@ -4635,6 +5036,8 @@ struct StatusContext {
     loaded_config_files: usize,
     discovered_config_files: usize,
     memory_file_count: usize,
+    memory_files: Vec<MemoryFileSummary>,
+    unloaded_memory_files: Vec<String>,
     project_root: Option<PathBuf>,
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
@@ -4656,11 +5059,18 @@ struct StatusContext {
     /// readable string so downstream claws can switch on the kind token
     /// instead of regex-scraping the prose.
     config_load_error_kind: Option<&'static str>,
+    mcp_validation: McpValidationSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BinaryProvenance {
     git_sha: Option<String>,
+    git_sha_short: Option<String>,
+    is_dirty: bool,
+    branch: Option<String>,
+    commit_date: String,
+    commit_timestamp: i64,
+    rustc_version: String,
     target: Option<String>,
     build_date: String,
     executable_path: Option<String>,
@@ -4682,6 +5092,12 @@ impl BinaryProvenance {
         json!({
             "status": self.status(),
             "git_sha": self.git_sha,
+            "git_sha_short": self.git_sha_short,
+            "is_dirty": self.is_dirty,
+            "branch": self.branch,
+            "commit_date": self.commit_date,
+            "commit_timestamp": self.commit_timestamp,
+            "rustc_version": self.rustc_version,
             "target": self.target,
             "build_date": self.build_date,
             "executable_path": self.executable_path,
@@ -4701,18 +5117,35 @@ fn known_build_metadata(value: Option<&str>) -> Option<String> {
     }
 }
 
+fn parse_build_bool(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+}
+
+fn parse_build_timestamp(value: Option<&str>) -> i64 {
+    value
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
 fn binary_provenance_for(cwd: Option<&Path>) -> BinaryProvenance {
     let git_sha = known_build_metadata(GIT_SHA);
+    let git_sha_short = known_build_metadata(GIT_SHA_SHORT).or_else(|| {
+        git_sha
+            .as_ref()
+            .map(|sha| sha.chars().take(12).collect::<String>())
+    });
     let target = known_build_metadata(BUILD_TARGET);
     let workspace_git_sha = cwd.and_then(|cwd| {
-        run_git_capture_in(cwd, &["rev-parse", "--short", "HEAD"])
+        run_git_capture_in(cwd, &["rev-parse", "HEAD"])
             .map(|sha| sha.trim().to_string())
             .filter(|sha| !sha.is_empty())
     });
     let workspace_match = git_sha
         .as_deref()
         .zip(workspace_git_sha.as_deref())
-        .map(|(binary, workspace)| binary.starts_with(workspace) || workspace.starts_with(binary));
+        .map(|(binary, workspace)| binary == workspace);
     let hint = if git_sha.is_none() {
         Some(
             "Build metadata did not include a git SHA; rebuild from a git checkout before filing provenance-sensitive dogfood reports."
@@ -4728,6 +5161,12 @@ fn binary_provenance_for(cwd: Option<&Path>) -> BinaryProvenance {
     };
     BinaryProvenance {
         git_sha,
+        git_sha_short,
+        is_dirty: parse_build_bool(GIT_DIRTY),
+        branch: known_build_metadata(GIT_BRANCH),
+        commit_date: known_build_metadata(GIT_COMMIT_DATE).unwrap_or_else(|| "unknown".to_string()),
+        commit_timestamp: parse_build_timestamp(GIT_COMMIT_TIMESTAMP),
+        rustc_version: known_build_metadata(RUSTC_VERSION).unwrap_or_else(|| "unknown".to_string()),
         target,
         build_date: DEFAULT_DATE.to_string(),
         executable_path: env::current_exe()
@@ -5820,6 +6259,7 @@ fn run_resume_command(
                     "load_failures": payload.load_failures.len(),
                 },
                 "config_load_error": payload.config_load_error,
+                "mcp_validation": payload.mcp_validation.json_value(),
                 "plugins": payload.plugins,
                 "load_failures": payload.load_failures,
             });
@@ -7728,6 +8168,7 @@ impl LiveCli {
                         "load_failures": payload.load_failures.len(),
                     },
                     "config_load_error": payload.config_load_error,
+                    "mcp_validation": payload.mcp_validation.json_value(),
                     "plugins": filtered_plugins,
                     "load_failures": payload.load_failures,
                 });
@@ -8531,9 +8972,10 @@ fn status_json_value(
     json!({
         "kind": "status",
         "action": "show",
-        "status": if degraded { "degraded" } else { "ok" },
+        "status": if degraded || context.mcp_validation.has_invalid_servers() { "degraded" } else { "ok" },
         "config_load_error": context.config_load_error,
         "config_load_error_kind": context.config_load_error_kind,
+        "mcp_validation": context.mcp_validation.json_value(),
         "model": model,
         "model_source": model_source,
         "model_raw": model_raw,
@@ -8598,6 +9040,9 @@ fn status_json_value(
             "loaded_config_files": context.loaded_config_files,
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
+            "memory_files": memory_files_json(&context.memory_files),
+            "unloaded_memory_files": context.unloaded_memory_files,
+            "mcp_validation": context.mcp_validation.json_value(),
         },
         "sandbox": {
             "enabled": context.sandbox_status.enabled,
@@ -8666,12 +9111,28 @@ fn status_context(
         runtime_config.as_ref().ok(),
         config_load_error.as_deref(),
     );
+    let memory_files = memory_file_summaries_for(
+        &cwd,
+        project_root.as_deref(),
+        &project_context.instruction_files,
+    );
+    let mcp_validation = runtime_config
+        .as_ref()
+        .ok()
+        .map(|runtime_config| McpValidationSummary::from_collection(runtime_config.mcp()))
+        .unwrap_or_default();
     Ok(StatusContext {
         cwd: cwd.clone(),
         session_path: session_path.map(Path::to_path_buf),
         loaded_config_files,
         discovered_config_files,
         memory_file_count: project_context.instruction_files.len(),
+        memory_files: memory_files.clone(),
+        unloaded_memory_files: unloaded_memory_candidates(
+            &cwd,
+            project_root.as_deref(),
+            &memory_files,
+        ),
         project_root,
         git_branch,
         git_summary,
@@ -8683,6 +9144,7 @@ fn status_context(
         binary_provenance: binary_provenance_for(Some(&cwd)),
         config_load_error,
         config_load_error_kind,
+        mcp_validation,
     })
 }
 
@@ -8787,6 +9249,7 @@ fn format_status_report(
   Boot preflight   {}
   Config files     loaded {}/{}
   Memory files     {}
+  Loaded memory    {}
   Suggested flow   /status → /diff → /commit",
             context.cwd.display(),
             context
@@ -8813,6 +9276,16 @@ fn format_status_report(
             context.loaded_config_files,
             context.discovered_config_files,
             context.memory_file_count,
+            if context.memory_files.is_empty() {
+                "<none>".to_string()
+            } else {
+                context
+                    .memory_files
+                    .iter()
+                    .map(|file| format!("{}:{}", file.source, file.path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
         ),
         format_sandbox_report(&context.sandbox_status),
     ]);
@@ -8979,8 +9452,8 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
             .to_string(),
         LocalHelpTopic::Init => "Init
   Usage            claw init [--output-format <format>]
-  Purpose          create .claw/, .claw.json, .gitignore, and CLAUDE.md in the current project
-  Output           list of created vs. skipped files (idempotent: safe to re-run)
+  Purpose          create .claw/settings.json, .claw.json, .gitignore, and CLAUDE.md in the current project
+  Output           per-artifact created/updated/partial/deferred/skipped status (idempotent: safe to re-run)
   Formats          text (default), json
   Related          claw status · claw doctor"
             .to_string(),
@@ -9246,7 +9719,7 @@ fn render_doctor_help_json() -> serde_json::Value {
         "command": "doctor",
         "schema_version": "1.0",
         "usage": "claw doctor [--output-format <format>]",
-        "purpose": "diagnose local auth, config, workspace, permissions, sandbox, boot preflight, and build metadata",
+        "purpose": "diagnose local auth, config, workspace memory, permissions, sandbox, boot preflight, and build metadata",
         "formats": ["text", "json"],
         "local_only": true,
         "requires_credentials": false,
@@ -9254,7 +9727,7 @@ fn render_doctor_help_json() -> serde_json::Value {
         "requires_session_resume": false,
         "mutates_workspace": false,
         "output_fields": ["kind", "action", "status", "message", "report", "has_failures", "summary", "checks", "allowed_tools"],
-        "check_names": ["auth", "config", "install source", "workspace", "boot preflight", "sandbox", "permissions", "system"],
+        "check_names": ["auth", "config", "mcp validation", "install source", "workspace", "memory", "boot preflight", "sandbox", "permissions", "system"],
         "status_values": ["ok", "warn", "fail"],
         "options": [
             {
@@ -9666,7 +10139,7 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     if project_context.instruction_files.is_empty() {
         lines.push("Discovered files".to_string());
         lines.push(
-            "  No CLAUDE instruction files discovered in the current directory ancestry."
+            "  No CLAUDE.md, CLAW.md, AGENTS.md, or scoped instruction files discovered in the current directory ancestry."
                 .to_string(),
         );
     } else {
@@ -9680,8 +10153,10 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
             };
             lines.push(format!("  {}. {}", index + 1, file.path.display(),));
             lines.push(format!(
-                "     lines={} preview={}",
+                "     source={} lines={} chars={} preview={}",
+                file.source(),
                 file.content.lines().count(),
+                file.char_count(),
                 preview
             ));
         }
@@ -9742,10 +10217,12 @@ fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_jso
     // Derive top-level status: "ok" when all artifacts succeeded (created or
     // skipped = idempotent); no failure path exists today so always "ok".
     let status = "ok";
-    // #783: already_initialized lets orchestrators detect the idempotent case
-    // without checking created.len() == 0; hint gives a stable next-action pointer.
+    // #783/#436: already_initialized lets orchestrators detect the idempotent
+    // case without checking every status bucket; deferred session storage does
+    // not make the workspace uninitialized because it is created on first save.
     let already_initialized = report.artifacts_with_status(InitStatus::Created).is_empty()
-        && report.artifacts_with_status(InitStatus::Updated).is_empty();
+        && report.artifacts_with_status(InitStatus::Updated).is_empty()
+        && report.artifacts_with_status(InitStatus::Partial).is_empty();
     let hint = if already_initialized {
         "Workspace already initialised. Run `claw doctor` to verify health, or edit CLAUDE.md to customise guidance."
     } else {
@@ -9760,6 +10237,8 @@ fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_jso
         "created": report.artifacts_with_status(InitStatus::Created),
         "updated": report.artifacts_with_status(InitStatus::Updated),
         "skipped": report.artifacts_with_status(InitStatus::Skipped),
+        "partial": report.artifacts_with_status(InitStatus::Partial),
+        "deferred": report.artifacts_with_status(InitStatus::Deferred),
         "artifacts": report.artifact_json_entries(),
         "hint": hint,
         "next_step": crate::init::InitReport::NEXT_STEP,
@@ -10249,10 +10728,12 @@ fn parse_titled_body(value: &str) -> Option<(String, String)> {
 }
 
 fn render_version_report() -> String {
-    let git_sha = GIT_SHA.unwrap_or("unknown");
+    let git_sha = GIT_SHA_SHORT.or(GIT_SHA).unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
+    let branch = GIT_BRANCH.unwrap_or("unknown");
+    let dirty = GIT_DIRTY.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Branch           {branch}\n  Dirty            {dirty}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
     )
 }
 
@@ -10576,6 +11057,7 @@ struct PluginsCommandPayload {
     reload_runtime: bool,
     status: &'static str,
     config_load_error: Option<String>,
+    mcp_validation: McpValidationSummary,
     plugins: Vec<Value>,
     load_failures: Vec<Value>,
 }
@@ -10588,9 +11070,16 @@ fn plugins_command_payload_for(
 ) -> Result<PluginsCommandPayload, Box<dyn std::error::Error>> {
     let loader = ConfigLoader::default_for(cwd);
     let loaded_config = load_config_with_warning_mode(&loader, config_warning_mode);
-    let (runtime_config, config_load_error) = match loaded_config {
-        Ok(runtime_config) => (runtime_config, None),
-        Err(error) => (runtime::RuntimeConfig::empty(), Some(error.to_string())),
+    let (runtime_config, config_load_error, mcp_validation) = match loaded_config {
+        Ok(runtime_config) => {
+            let mcp_validation = McpValidationSummary::from_collection(runtime_config.mcp());
+            (runtime_config, None, mcp_validation)
+        }
+        Err(error) => (
+            runtime::RuntimeConfig::empty(),
+            Some(error.to_string()),
+            McpValidationSummary::default(),
+        ),
     };
     let mut manager = build_plugin_manager(cwd, &loader, &runtime_config);
     let result = handle_plugins_slash_command(action, target, &mut manager)?;
@@ -10598,6 +11087,7 @@ fn plugins_command_payload_for(
     Ok(plugins_command_payload_from_result(
         result,
         config_load_error,
+        mcp_validation,
         &report,
     ))
 }
@@ -10605,10 +11095,14 @@ fn plugins_command_payload_for(
 fn plugins_command_payload_from_result(
     result: PluginsCommandResult,
     config_load_error: Option<String>,
+    mcp_validation: McpValidationSummary,
     report: &plugins::PluginRegistryReport,
 ) -> PluginsCommandPayload {
     let failures = report.failures();
-    let status = if config_load_error.is_some() || !failures.is_empty() {
+    let status = if config_load_error.is_some()
+        || mcp_validation.has_invalid_servers()
+        || !failures.is_empty()
+    {
         "degraded"
     } else {
         "ok"
@@ -10618,6 +11112,11 @@ fn plugins_command_payload_from_result(
             "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial plugins view\n  Details          {error}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
             result.message
         ),
+        None if mcp_validation.has_invalid_servers() => format!(
+            "MCP validation\n  Status           warn\n  Summary          {} MCP server entries are invalid; reporting plugins with valid MCP siblings only\n  Hint             Inspect `claw mcp list --output-format json` invalid_servers and fix each rejected mcpServers entry.\n\n{}",
+            mcp_validation.invalid_count(),
+            result.message
+        ),
         None => result.message,
     };
     PluginsCommandPayload {
@@ -10625,6 +11124,7 @@ fn plugins_command_payload_from_result(
         reload_runtime: result.reload_runtime,
         status,
         config_load_error,
+        mcp_validation,
         plugins: report.summaries().iter().map(plugin_summary_json).collect(),
         load_failures: failures.iter().map(plugin_load_failure_json).collect(),
     }
@@ -13546,6 +14046,21 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+        assert_eq!(
+            parse_args(&["--compact".to_string(), "hello".to_string()])
+                .expect("compact single-word prompt should parse"),
+            CliAction::Prompt {
+                prompt: "hello".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::WorkspaceWrite,
+                compact: true,
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+            }
+        );
     }
 
     #[test]
@@ -14367,9 +14882,10 @@ mod tests {
     }
 
     #[test]
-    fn plugins_degrades_gracefully_on_malformed_mcp_config() {
-        // Keep the plugins surface consistent with status/doctor/mcp: a bad
-        // MCP entry should not make local plugin introspection unusable.
+    fn plugins_degrades_on_invalid_mcp_server_without_global_config_error_440() {
+        // #440: invalid MCP entries should not make local plugin introspection
+        // unusable, and should surface as validation metadata instead of a
+        // whole-config parse failure.
         let _guard = env_lock();
         let root = temp_dir();
         let cwd = root.join("project-with-malformed-mcp-for-plugins");
@@ -14402,16 +14918,19 @@ mod tests {
         }
 
         assert_eq!(payload.status, "degraded");
-        let err = payload
-            .config_load_error
-            .as_deref()
-            .expect("config_load_error should be populated");
-        assert!(
-            err.contains("mcpServers.missing-command"),
-            "config_load_error should name the malformed MCP field: {err}"
+        assert!(payload.config_load_error.is_none());
+        assert_eq!(payload.mcp_validation.total_configured, 1);
+        assert_eq!(payload.mcp_validation.valid_count, 0);
+        assert_eq!(payload.mcp_validation.invalid_count(), 1);
+        assert_eq!(
+            payload.mcp_validation.invalid_servers[0].name,
+            "missing-command"
         );
-        assert!(payload.message.contains("Config load error"));
-        assert!(payload.message.contains("partial plugins view"));
+        assert!(payload.mcp_validation.invalid_servers[0]
+            .reason
+            .contains("missing string field command"));
+        assert!(payload.message.contains("MCP validation"));
+        assert!(payload.message.contains("valid MCP siblings only"));
         assert!(payload.message.contains("Plugins"));
 
         let _ = std::fs::remove_dir_all(root);
@@ -14427,14 +14946,13 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project-with-malformed-mcp");
         std::fs::create_dir_all(&cwd).expect("project dir should exist");
-        // One valid server + one malformed entry missing `command`.
+        // Top-level `mcpServers` shape errors still degrade through the
+        // config_load_error path; per-server errors are handled by the #440
+        // MCP validation summary instead.
         std::fs::write(
             cwd.join(".claw.json"),
             r#"{
-  "mcpServers": {
-    "everything": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"]},
-    "missing-command": {"args": ["arg-only-no-command"]}
-  }
+  "mcpServers": "not-an-object"
 }
 "#,
         )
@@ -14445,17 +14963,17 @@ mod tests {
                 .expect("status_context should not hard-fail on config parse errors (#143)")
         });
 
-        // Phase 1 contract: config_load_error is populated with the parse error.
+        // Config-shape errors still populate config_load_error.
         let err = context
             .config_load_error
             .as_ref()
-            .expect("config_load_error should be Some when config parse fails");
+            .expect("config_load_error should be Some when config shape parsing fails");
         assert!(
-            err.contains("mcpServers.missing-command"),
-            "config_load_error should name the malformed field path: {err}"
+            err.contains("mcpServers"),
+            "config_load_error should name the malformed mcpServers path: {err}"
         );
         assert!(
-            err.contains("missing string field command"),
+            err.contains("must be an object"),
             "config_load_error should carry the underlying parse error: {err}"
         );
 
@@ -14497,7 +15015,7 @@ mod tests {
         assert!(
             json.get("config_load_error")
                 .and_then(|v| v.as_str())
-                .is_some_and(|s| s.contains("mcpServers.missing-command")),
+                .is_some_and(|s| s.contains("mcpServers")),
             "config_load_error should surface in JSON output: {json}"
         );
         // Independent fields still populated.
@@ -15464,16 +15982,15 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
-        let error = parse_args(&["/status".to_string()])
-            .expect_err("/status should remain REPL-only when invoked directly");
-        // #829: prefix changed from "interactive-only" to "interactive_only:"
-        assert!(
-            error.contains("interactive_only:"),
-            "expected interactive_only: prefix, got: {error}"
-        );
-        assert!(
-            error.contains("claw --resume SESSION.jsonl /status"),
-            "expected --resume suggestion for resume-safe /status, got: {error}"
+        assert_eq!(
+            parse_args(&["/status".to_string()]).expect("/status should parse as local status"),
+            CliAction::Status {
+                model: DEFAULT_MODEL.to_string(),
+                model_flag_raw: None,
+                permission_mode: PermissionModeProvenance::default_fallback(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+            }
         );
     }
 
@@ -16184,6 +16701,16 @@ mod tests {
                 loaded_config_files: 2,
                 discovered_config_files: 3,
                 memory_file_count: 4,
+                memory_files: vec![super::MemoryFileSummary {
+                    path: "/tmp/project/CLAUDE.md".to_string(),
+                    source: "claude_md".to_string(),
+                    origin: "workspace".to_string(),
+                    scope_path: "/tmp/project".to_string(),
+                    outside_project: false,
+                    chars: 42,
+                    contributes: true,
+                }],
+                unloaded_memory_files: Vec::new(),
                 project_root: Some(PathBuf::from("/tmp")),
                 git_branch: Some("main".to_string()),
                 git_summary: GitWorkspaceSummary {
@@ -16208,6 +16735,7 @@ mod tests {
                 binary_provenance: super::binary_provenance_for(None),
                 config_load_error: None,
                 config_load_error_kind: None,
+                mcp_validation: super::McpValidationSummary::default(),
             },
             None, // #148
             None,
@@ -16228,6 +16756,7 @@ mod tests {
             status.contains("Git state        dirty · 3 files · 1 staged, 1 unstaged, 1 untracked")
         );
         assert!(status.contains("Changed files    3"));
+        assert!(status.contains("Loaded memory    claude_md:/tmp/project/CLAUDE.md"));
         assert!(status.contains("Staged           1"));
         assert!(status.contains("Unstaged         1"));
         assert!(status.contains("Untracked        1"));
@@ -16334,6 +16863,8 @@ mod tests {
             loaded_config_files: 0,
             discovered_config_files: 0,
             memory_file_count: 0,
+            memory_files: Vec::new(),
+            unloaded_memory_files: Vec::new(),
             project_root: Some(PathBuf::from("/tmp/project")),
             git_branch: Some("feature/stale-base".to_string()),
             git_summary: GitWorkspaceSummary::default(),
@@ -16355,6 +16886,7 @@ mod tests {
             binary_provenance: super::binary_provenance_for(None),
             config_load_error: None,
             config_load_error_kind: None,
+            mcp_validation: super::McpValidationSummary::default(),
         };
 
         let check = super::check_workspace_health(&context);
@@ -16369,6 +16901,56 @@ mod tests {
     }
 
     #[test]
+    fn memory_health_surfaces_loaded_and_unloaded_files_438() {
+        let context = super::StatusContext {
+            cwd: PathBuf::from("/tmp/project"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 1,
+            memory_files: vec![super::MemoryFileSummary {
+                path: "/tmp/project/CLAUDE.md".to_string(),
+                source: "claude_md".to_string(),
+                origin: "workspace".to_string(),
+                scope_path: "/tmp/project".to_string(),
+                outside_project: false,
+                chars: 12,
+                contributes: true,
+            }],
+            unloaded_memory_files: vec!["/tmp/project/AGENTS.md".to_string()],
+            project_root: Some(PathBuf::from("/tmp/project")),
+            git_branch: Some("main".to_string()),
+            git_summary: GitWorkspaceSummary::default(),
+            branch_freshness: test_branch_freshness(),
+            stale_base_state: super::BaseCommitState::NoExpectedBase,
+            session_lifecycle: SessionLifecycleSummary {
+                kind: SessionLifecycleKind::SavedOnly,
+                pane_id: None,
+                pane_command: None,
+                pane_path: None,
+                workspace_dirty: false,
+                abandoned: false,
+            },
+            boot_preflight: test_boot_preflight(),
+            sandbox_status: runtime::SandboxStatus::default(),
+            binary_provenance: super::binary_provenance_for(None),
+            config_load_error: None,
+            config_load_error_kind: None,
+            mcp_validation: super::McpValidationSummary::default(),
+        };
+
+        let check = super::check_memory_health(&context);
+
+        assert_eq!(check.level, super::DiagnosticLevel::Warn);
+        assert_eq!(check.data["memory_file_count"], 1);
+        assert_eq!(check.data["memory_files"][0]["source"], "claude_md");
+        assert_eq!(
+            check.data["unloaded_memory_files"][0],
+            "/tmp/project/AGENTS.md"
+        );
+    }
+
+    #[test]
     fn status_json_surfaces_session_lifecycle_for_clawhip() {
         let context = super::StatusContext {
             cwd: PathBuf::from("/tmp/project"),
@@ -16376,6 +16958,8 @@ mod tests {
             loaded_config_files: 0,
             discovered_config_files: 0,
             memory_file_count: 0,
+            memory_files: Vec::new(),
+            unloaded_memory_files: Vec::new(),
             project_root: Some(PathBuf::from("/tmp/project")),
             git_branch: Some("feature/session-lifecycle".to_string()),
             git_summary: GitWorkspaceSummary::default(),
@@ -16394,6 +16978,7 @@ mod tests {
             binary_provenance: super::binary_provenance_for(None),
             config_load_error: None,
             config_load_error_kind: None,
+            mcp_validation: super::McpValidationSummary::default(),
         };
 
         let value = status_json_value(
