@@ -99,6 +99,12 @@ cd rust
 ./target/debug/claw "explain rust/crates/runtime/src/lib.rs"
 ```
 
+Use the POSIX `--` end-of-flags separator when the shorthand prompt itself begins with `-` or `--`:
+
+```bash
+./target/debug/claw -- "-summarize this dash-prefixed text"
+```
+
 ### JSON output for scripting
 
 ```bash
@@ -197,6 +203,10 @@ cd rust
 ```
 
 Global workspace override flags: `--cwd PATH`, `-C PATH`, and `--directory PATH` are accepted before any subcommand. They are validated before command dispatch and take precedence over the process `$PWD`; invalid paths return typed `invalid_cwd` JSON errors in JSON mode.
+
+`--allowedTools` accepts canonical snake_case tool names (for example `read_file`, `glob_search`, `web_fetch`) plus documented aliases such as `read`, `glob`, `Read`, and `WebFetch`. `claw status --output-format json` exposes `allowed_tools.available` and `allowed_tools.aliases`, and invalid values return typed `invalid_tool_name` JSON with `tool_name`, `available`, and `tool_aliases`. A missing value before a subcommand or another flag returns `missing_argument` with `argument:"--allowedTools"`.
+
+`--output-format` accepts `text` or `json` case-insensitively and normalizes to the canonical lowercase modes. `CLAW_OUTPUT_FORMAT=json` sets the default output format for scripts, while an explicit `--output-format` flag takes precedence. Repeating the flag emits a stderr warning and JSON status envelopes expose `format_source`, `format_raw`, and `format_overridden` so composed flag arrays are auditable; invalid values return typed `invalid_output_format` JSON with `value` and `expected:["text","json"]`.
 
 Supported permission modes (default: `workspace-write`):
 
@@ -442,6 +452,9 @@ The name "codex" appears in the Claw Code ecosystem but it does **not** refer to
 export HTTPS_PROXY="http://proxy.corp.example:3128"
 export HTTP_PROXY="http://proxy.corp.example:3128"
 export NO_PROXY="localhost,127.0.0.1,.corp.example"
+export CLAW_OUTPUT_FORMAT="json"   # default non-interactive output format; flags override it
+export CLAW_LOG="debug"             # claw-specific log level selector surfaced by help/doctor
+export RUST_LOG="claw=debug"        # Rust logging convention surfaced by help/doctor
 
 cd rust
 ./target/debug/claw prompt "hello via the corporate proxy"

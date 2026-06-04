@@ -1252,9 +1252,13 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     assert!(summary["ok"].as_u64().is_some());
     assert!(summary["warnings"].as_u64().is_some());
     assert!(summary["failures"].as_u64().is_some());
+    assert_eq!(doctor["allowed_tools"]["aliases"]["WebFetch"], "web_fetch");
+    assert!(doctor["allowed_tools"]["available"]
+        .as_array()
+        .is_some_and(|available| available.iter().any(|name| name == "web_fetch")));
 
     let checks = doctor["checks"].as_array().expect("doctor checks");
-    assert_eq!(checks.len(), 7);
+    assert_eq!(checks.len(), 8);
     let check_names = checks
         .iter()
         .map(|check| {
@@ -1279,6 +1283,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
             "workspace",
             "boot preflight",
             "sandbox",
+            "permissions",
             "system"
         ]
     );
@@ -2340,6 +2345,11 @@ fn assert_non_empty_action(parsed: &Value, args: &[&str]) {
 fn run_claw(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
     command.current_dir(current_dir).args(args);
+    for key in ["CLAW_OUTPUT_FORMAT", "CLAW_LOG", "RUST_LOG"] {
+        if !envs.iter().any(|(env_key, _)| *env_key == key) {
+            command.env_remove(key);
+        }
+    }
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -2716,6 +2726,186 @@ fn flag_value_errors_have_error_kind_and_hint_756() {
         parsed2["hint"].as_str().map_or(false, |h| !h.is_empty()),
         "missing --model hint must be non-empty (#756): {parsed2}"
     );
+}
+#[test]
+fn output_format_flags_and_env_have_typed_contract_433() {
+    let root = unique_temp_dir("output-format-433");
+    fs::create_dir_all(&root).expect("temp dir");
+
+    let repeated = run_claw(
+        &root,
+        &[
+            "--output-format",
+            "text",
+            "--output-format",
+            "JSON",
+            "status",
+        ],
+        &[],
+    );
+    assert!(repeated.status.success());
+    let repeated_stderr = String::from_utf8_lossy(&repeated.stderr);
+    assert!(
+        repeated_stderr.contains("warning: --output-format specified multiple times"),
+        "repeated output-format should warn on stderr: {repeated_stderr}"
+    );
+    let repeated_json = parse_json_stdout(&repeated, "repeated output-format status");
+    assert_eq!(repeated_json["kind"], "status");
+    assert_eq!(repeated_json["format_source"], "flag");
+    assert_eq!(repeated_json["format_raw"], "JSON");
+    assert_eq!(repeated_json["format_overridden"][0], "text");
+
+    let repeated_text = run_claw(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "--output-format",
+            "text",
+            "status",
+        ],
+        &[],
+    );
+    assert!(repeated_text.status.success());
+    let repeated_text_stderr = String::from_utf8_lossy(&repeated_text.stderr);
+    assert!(
+        repeated_text_stderr.contains("using last value 'text'"),
+        "json-to-text repeated output-format should warn: {repeated_text_stderr}"
+    );
+    let repeated_text_stdout = String::from_utf8_lossy(&repeated_text.stdout);
+    assert!(
+        repeated_text_stdout.contains("Status"),
+        "last text output-format should produce text status: {repeated_text_stdout}"
+    );
+
+    for value in ["json", "JSON", "Json"] {
+        let parsed = assert_json_command(&root, &["--output-format", value, "status"]);
+        assert_eq!(
+            parsed["kind"], "status",
+            "case {value} should parse as JSON"
+        );
+        assert_eq!(parsed["format_source"], "flag");
+        assert_eq!(parsed["format_raw"], value);
+    }
+
+    let from_env =
+        assert_json_command_with_env(&root, &["status"], &[("CLAW_OUTPUT_FORMAT", "json")]);
+    assert_eq!(from_env["kind"], "status");
+    assert_eq!(from_env["format_source"], "env");
+    assert_eq!(from_env["format_raw"], "json");
+
+    let flag_overrides_env = run_claw(
+        &root,
+        &["--output-format", "json", "status"],
+        &[("CLAW_OUTPUT_FORMAT", "text")],
+    );
+    assert!(flag_overrides_env.status.success());
+    let override_json = parse_json_stdout(&flag_overrides_env, "flag overrides env output-format");
+    assert_eq!(override_json["kind"], "status");
+    assert_eq!(override_json["format_source"], "flag");
+    assert_eq!(override_json["format_raw"], "json");
+    assert_eq!(
+        override_json["format_overridden"].as_array().map(Vec::len),
+        Some(0)
+    );
+
+    let invalid = run_claw(&root, &["--output-format", "YAML", "status"], &[]);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(
+        invalid.stderr.is_empty(),
+        "invalid output-format in JSON mode must keep stderr empty: {}",
+        String::from_utf8_lossy(&invalid.stderr)
+    );
+    let invalid_json = parse_json_stdout(&invalid, "invalid output-format JSON error");
+    assert_eq!(invalid_json["error_kind"], "invalid_output_format");
+    assert_eq!(invalid_json["value"], "YAML");
+    assert_eq!(
+        invalid_json["expected"],
+        serde_json::json!(["text", "json"])
+    );
+    assert!(invalid_json["hint"]
+        .as_str()
+        .is_some_and(|hint| hint.contains("--output-format json")));
+
+    let help = assert_json_command(&root, &["--output-format", "json", "help"]);
+    let help_text = help["message"].as_str().expect("help message");
+    assert!(
+        help_text.contains("CLAW_OUTPUT_FORMAT"),
+        "help should document CLAW_OUTPUT_FORMAT: {help_text}"
+    );
+    assert!(
+        help_text.contains("CLAW_LOG"),
+        "help should document CLAW_LOG: {help_text}"
+    );
+    assert!(
+        help_text.contains("RUST_LOG"),
+        "help should document RUST_LOG: {help_text}"
+    );
+
+    let doctor = assert_json_command_with_env(
+        &root,
+        &["doctor"],
+        &[
+            ("CLAW_OUTPUT_FORMAT", "json"),
+            ("CLAW_LOG", "debug"),
+            ("RUST_LOG", "claw=debug"),
+        ],
+    );
+    let system_check = doctor["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "system")
+        .expect("system check");
+    assert_eq!(system_check["claw_output_format"], "json");
+    assert_eq!(system_check["claw_log"], "debug");
+    assert_eq!(system_check["rust_log"], "claw=debug");
+}
+
+#[test]
+fn allowed_tools_errors_have_typed_json_and_alias_map_432() {
+    let root = unique_temp_dir("allowed-tools-432");
+    fs::create_dir_all(&root).expect("temp dir");
+
+    let missing = run_claw(
+        &root,
+        &["--allowedTools", "status", "--output-format", "json"],
+        &[],
+    );
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        missing.stderr.is_empty(),
+        "JSON missing allowedTools value must keep stderr empty: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    let missing_json = parse_json_stdout(&missing, "allowedTools subcommand missing value");
+    assert_eq!(missing_json["error_kind"], "missing_argument");
+    assert_eq!(missing_json["argument"], "--allowedTools");
+    assert!(missing_json["hint"]
+        .as_str()
+        .is_some_and(|hint| { hint.contains("--allowedTools") && hint.contains("read,glob") }));
+
+    let invalid = run_claw(
+        &root,
+        &["--output-format", "json", "--allowedTools", "teleport"],
+        &[],
+    );
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(
+        invalid.stderr.is_empty(),
+        "JSON invalid allowedTools value must keep stderr empty: {}",
+        String::from_utf8_lossy(&invalid.stderr)
+    );
+    let invalid_json = parse_json_stdout(&invalid, "allowedTools invalid tool");
+    assert_eq!(invalid_json["error_kind"], "invalid_tool_name");
+    assert_eq!(invalid_json["tool_name"], "teleport");
+    assert!(invalid_json["available"]
+        .as_array()
+        .is_some_and(|available| available.iter().any(|name| name == "web_fetch")));
+    assert_eq!(invalid_json["tool_aliases"]["WebFetch"], "web_fetch");
+    assert!(invalid_json["hint"]
+        .as_str()
+        .is_some_and(|hint| { hint.contains("canonical snake_case") && hint.contains("aliases") }));
 }
 
 #[test]
