@@ -49,6 +49,14 @@ const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
 const OPENAI_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
 const DASHSCOPE_MAX_REQUEST_BODY_BYTES: usize = 6_291_456; // 6MB (observed limit in dogfood)
 
+pub const OLLAMA_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    provider_name: "Ollama",
+    api_key_env: "OLLAMA_HOST",
+    base_url_env: "OLLAMA_HOST",
+    default_base_url: "http://127.0.0.1:11434/v1",
+    max_request_body_bytes: 104_857_600,
+};
+
 impl OpenAiCompatConfig {
     #[must_use]
     pub const fn xai() -> Self {
@@ -149,6 +157,22 @@ impl OpenAiCompatClient {
         };
         Ok(Self::new(api_key, config).with_base_url(base_url))
     }
+    /// Create an Ollama client from `OLLAMA_HOST` env var.
+    /// Ollama requires no API key; a placeholder is used for the Authorization header.
+    pub fn from_ollama_env() -> Option<Self> {
+        let host =
+            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+        let base_url = format!("{}/v1", host.trim_end_matches('/'));
+        Some(Self {
+            http: build_http_client_or_default(),
+            api_key: "ollama".to_string(),
+            config: OLLAMA_CONFIG,
+            base_url,
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+        })
+    }
 
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -172,6 +196,18 @@ impl OpenAiCompatClient {
         self.max_retries = max_retries;
         self.initial_backoff = initial_backoff;
         self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Replace the internal HTTP client with one that respects the given
+    /// timeout configuration.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: &crate::http_client::TimeoutConfig) -> Self {
+        self.http = crate::http_client::build_http_client_with_opts(
+            &crate::http_client::ProxyConfig::from_env(),
+            timeout,
+        )
+        .unwrap_or_else(|_| reqwest::Client::new());
         self
     }
 
@@ -217,6 +253,7 @@ impl OpenAiCompatClient {
                         reqwest::StatusCode::from_u16(code.unwrap_or(400))
                             .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
                     ),
+                    retry_after: None,
                 });
             }
         }
@@ -270,7 +307,12 @@ impl OpenAiCompatClient {
                 break retryable_error;
             }
 
-            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
+            let delay = if let Some(retry_after) = retryable_error.retry_after() {
+                retry_after
+            } else {
+                self.jittered_backoff_for_attempt(attempts)?
+            };
+            tokio::time::sleep(delay).await;
         };
 
         Err(ApiError::RetriesExhausted {
@@ -1561,6 +1603,7 @@ fn parse_sse_frame(
                     body: trimmed.chars().take(500).collect(),
                     retryable: false,
                     suggested_action: suggested_action_for_status(status),
+                    retry_after: None,
                 });
             }
         }
@@ -1576,6 +1619,7 @@ fn parse_sse_frame(
                 body: trimmed.chars().take(200).collect(),
                 retryable: false,
                 suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+                retry_after: None,
             });
         }
         return Ok(None);
@@ -1611,6 +1655,7 @@ fn parse_sse_frame(
                 body: payload.clone(),
                 retryable: false,
                 suggested_action: suggested_action_for_status(status),
+                retry_after: None,
             });
         }
     }
@@ -1627,6 +1672,7 @@ fn parse_sse_frame(
             body: payload.chars().take(200).collect(),
             retryable: false,
             suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+            retry_after: None,
         });
     }
     serde_json::from_str::<ChatCompletionChunk>(&payload)
@@ -1678,10 +1724,12 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
 
-    let request_id = request_id_from_headers(response.headers());
+    let headers = response.headers().clone();
+    let request_id = request_id_from_headers(&headers);
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
+    let retry_after = parse_retry_after(&headers, status);
 
     let suggested_action = suggested_action_for_status(status);
 
@@ -1697,11 +1745,41 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         body,
         retryable,
         suggested_action,
+        retry_after,
     })
+}
+
+fn parse_retry_after(
+    headers: &reqwest::header::HeaderMap,
+    status: reqwest::StatusCode,
+) -> Option<std::time::Duration> {
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Some providers return HTTP 400 with an unparseable body when a gateway
+/// or proxy flakes (e.g. "HTTP 400 from backend (no parseable body)").
+/// These are transient network blips, not actual bad requests, and should
+/// be retried.
+fn is_retryable_400(status: reqwest::StatusCode, body: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains("no parseable body")
+        || lowered.contains("connection reset")
+        || lowered.contains("broken pipe")
+        || lowered.contains("empty reply from server")
 }
 
 /// Generate a suggested user action based on the HTTP status code and error context.

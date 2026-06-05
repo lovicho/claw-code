@@ -1121,7 +1121,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", render_diff_report()?);
             }
             CliOutputFormat::Json => {
-                let cwd = env::current_dir()?;
+                let cwd = friendly_cwd(env::current_dir()?);
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&render_diff_json_for(&cwd)?)?
@@ -1598,6 +1598,16 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing_flag_value: missing value for --base-commit.\nUsage: --base-commit <git-sha>".to_string())?;
+                // #122: validate that base-commit looks like a git SHA (hex, 7-64 chars)
+                if value.len() < 7
+                    || value.len() > 64
+                    || !value.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    return Err(format!(
+                        "invalid_flag_value: --base-commit expects a hex SHA (7-64 chars), got '{}'.\nUsage: --base-commit <git-sha>",
+                        value
+                    ));
+                }
                 base_commit = Some(value.clone());
                 index += 2;
             }
@@ -1908,6 +1918,25 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             .map(PermissionModeProvenance::from_flag)
             .unwrap_or_else(permission_mode_provenance_for_current_dir)
     };
+
+    // #98: --compact is only meaningful for prompt mode. When a known non-prompt
+    // subcommand is being dispatched, reject --compact so callers don't silently
+    // lose the flag.
+    if compact
+        && rest
+            .first()
+            .map(|s| s.as_str())
+            .is_some_and(|s| s != "prompt")
+    {
+        // Allow compact for the default prompt fallback (unknown tokens).
+        // Only reject for known top-level subcommands that don't use compact.
+        let first = rest[0].as_str();
+        if is_known_top_level_subcommand(first) && first != "prompt" {
+            return Err(format!(
+                "invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact"
+            ));
+        }
+    }
 
     match rest[0].as_str() {
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
@@ -2874,6 +2903,14 @@ fn resolve_model_alias_with_config(model: &str) -> String {
 /// Rejects: empty, whitespace-only, strings with spaces, or invalid chars.
 fn validate_model_syntax(model: &str) -> Result<(), String> {
     let trimmed = model.trim();
+    // Ollama models use names like "qwen3:8b" that don't match provider/model
+    // syntax. Skip strict validation when OLLAMA_HOST is configured.
+    if std::env::var_os("OLLAMA_HOST").is_some() {
+        if trimmed.is_empty() {
+            return Err("invalid model syntax: model string cannot be empty.\nUsage: --model <model-name>  e.g. --model qwen3:8b".to_string());
+        }
+        return Ok(());
+    }
     if trimmed.is_empty() {
         return Err("invalid model syntax: model string cannot be empty.\nUsage: --model <provider/model>  e.g. --model anthropic/claude-opus-4-7".to_string());
     }
@@ -3579,7 +3616,7 @@ fn render_doctor_report(
     config_warning_mode: ConfigWarningMode,
     permission_mode: PermissionModeProvenance,
 ) -> Result<DoctorReport, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
+    let cwd = friendly_cwd(env::current_dir()?);
     let config_loader = ConfigLoader::default_for(&cwd);
     let config = load_config_with_warning_mode(&config_loader, config_warning_mode);
     let discovered_config = config_loader.discover();
@@ -4268,7 +4305,14 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
             "Git branch       {}",
             context.git_branch.as_deref().unwrap_or("unknown")
         ),
-        format!("Git state        {}", context.git_summary.headline()),
+        format!(
+            "Git state        {}",
+            if context.project_root.is_some() {
+                context.git_summary.headline()
+            } else {
+                "no git repo".to_string()
+            }
+        ),
         format!("Changed files    {}", context.git_summary.changed_files),
         format!(
             "Memory files     {} · config files loaded {}/{}",
@@ -4305,7 +4349,11 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
         ("git_branch".to_string(), json!(context.git_branch)),
         (
             "git_state".to_string(),
-            json!(context.git_summary.headline()),
+            json!(if context.project_root.is_some() {
+                context.git_summary.headline()
+            } else {
+                "no_git_repo".to_string()
+            }),
         ),
         (
             "changed_files".to_string(),
@@ -4759,28 +4807,96 @@ fn build_rust_resolver_manifest(workspace_dir: &Path) -> Result<Value, Box<dyn s
 }
 
 fn print_bootstrap_plan(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let phases = runtime::BootstrapPlan::claude_code_default()
-        .phases()
-        .iter()
-        .map(|phase| format!("{phase:?}"))
-        .collect::<Vec<_>>();
+    let phases = runtime::BootstrapPlan::claude_code_default();
     match output_format {
         CliOutputFormat::Text => {
-            for phase in &phases {
-                println!("- {phase}");
+            for phase in phases.phases() {
+                println!("- {phase:?}");
             }
         }
-        CliOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "bootstrap-plan",
-                "action": "show",
-                "status": "ok",
-                "phases": phases,
-            }))?
-        ),
+        CliOutputFormat::Json => {
+            // #412: emit structured phase objects with label and description
+            let phase_objects: Vec<serde_json::Value> = phases
+                .phases()
+                .iter()
+                .enumerate()
+                .map(|(i, phase)| {
+                    let (label, description) = bootstrap_phase_metadata(phase);
+                    json!({
+                        "id": format!("{phase:?}"),
+                        "label": label,
+                        "description": description,
+                        "order": i,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "bootstrap-plan",
+                    "action": "show",
+                    "status": "ok",
+                    "total_phases": phases.phases().len(),
+                    "phases": phase_objects,
+                }))?
+            );
+        }
     }
     Ok(())
+}
+
+fn bootstrap_phase_metadata(phase: &runtime::BootstrapPhase) -> (&'static str, &'static str) {
+    use runtime::BootstrapPhase::*;
+    match phase {
+        CliEntry => (
+            "CLI Entry",
+            "Command-line argument parsing and global flag resolution",
+        ),
+        FastPathVersion => (
+            "Fast-Path Version",
+            "Short-circuit version/help requests before full startup",
+        ),
+        StartupProfiler => (
+            "Startup Profiler",
+            "Instrument startup timing for diagnostics",
+        ),
+        SystemPromptFastPath => (
+            "System Prompt Fast-Path",
+            "Serve system-prompt requests without provider init",
+        ),
+        ChromeMcpFastPath => (
+            "Chrome MCP Fast-Path",
+            "Serve Chrome MCP requests without full runtime",
+        ),
+        DaemonWorkerFastPath => (
+            "Daemon Worker Fast-Path",
+            "Handle daemon worker requests without full init",
+        ),
+        BridgeFastPath => (
+            "Bridge Fast-Path",
+            "Bridge/sibling process communication without full init",
+        ),
+        DaemonFastPath => (
+            "Daemon Fast-Path",
+            "Daemon lifecycle management without full runtime",
+        ),
+        BackgroundSessionFastPath => (
+            "Background Session Fast-Path",
+            "Resume/list background sessions without full init",
+        ),
+        TemplateFastPath => (
+            "Template Fast-Path",
+            "Template rendering without full runtime",
+        ),
+        EnvironmentRunnerFastPath => (
+            "Environment Runner Fast-Path",
+            "Environment/runner dispatch without full init",
+        ),
+        MainRuntime => (
+            "Main Runtime",
+            "Full interactive REPL or one-shot prompt execution",
+        ),
+    }
 }
 
 fn print_system_prompt(
@@ -5640,6 +5756,31 @@ struct GitWorkspaceSummary {
     unstaged_files: usize,
     untracked_files: usize,
     conflicted_files: usize,
+    /// #89: detected mid-operation git state (rebase, merge, cherry-pick, bisect)
+    operation: GitOperation,
+}
+
+/// #89: mid-operation git states detected from branch header in `git status --short --branch`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum GitOperation {
+    #[default]
+    None,
+    Rebase,
+    Merge,
+    CherryPick,
+    Bisect,
+}
+
+impl GitOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Rebase => "rebase-in-progress",
+            Self::Merge => "merge-in-progress",
+            Self::CherryPick => "cherry-pick-in-progress",
+            Self::Bisect => "bisect-in-progress",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5675,6 +5816,8 @@ struct SessionLifecycleSummary {
     pane_path: Option<PathBuf>,
     workspace_dirty: bool,
     abandoned: bool,
+    // #326: all panes matching this workspace, not just the first one
+    all_panes: Vec<TmuxPaneSnapshot>,
 }
 
 impl SessionLifecycleSummary {
@@ -5700,6 +5843,14 @@ impl SessionLifecycleSummary {
             "pane_path": self.pane_path.as_ref().map(|path| path.display().to_string()),
             "workspace_dirty": self.workspace_dirty,
             "abandoned": self.abandoned,
+            // #326: include all workspace panes in the JSON output
+            "panes": self.all_panes.iter().map(|p| {
+                json!({
+                    "pane_id": p.pane_id,
+                    "pane_command": p.current_command,
+                    "pane_path": p.current_path.display().to_string(),
+                })
+            }).collect::<Vec<_>>(),
         })
     }
 }
@@ -5717,8 +5868,18 @@ impl GitWorkspaceSummary {
     }
 
     fn headline(self) -> String {
+        // #89: prefix with operation state when mid-operation
+        let op_prefix = if self.operation != GitOperation::None {
+            format!("{}, ", self.operation.as_str())
+        } else {
+            String::new()
+        };
         if self.is_clean() {
-            "clean".to_string()
+            if self.operation != GitOperation::None {
+                format!("{op_prefix}clean")
+            } else {
+                "clean".to_string()
+            }
         } else {
             let mut details = Vec::new();
             if self.staged_files > 0 {
@@ -5734,7 +5895,7 @@ impl GitWorkspaceSummary {
                 details.push(format!("{} conflicted", self.conflicted_files));
             }
             format!(
-                "dirty · {} files · {}",
+                "{op_prefix}dirty · {} files · {}",
                 self.changed_files,
                 details.join(", ")
             )
@@ -5751,23 +5912,31 @@ fn classify_session_lifecycle_from_panes(
     panes: Vec<TmuxPaneSnapshot>,
 ) -> SessionLifecycleSummary {
     let workspace_dirty = git_worktree_is_dirty(workspace);
-    let mut idle_shell = None;
+    let mut idle_shell: Option<TmuxPaneSnapshot> = None;
+    let mut all_workspace_panes: Vec<TmuxPaneSnapshot> = Vec::new();
+    let mut running_pane: Option<TmuxPaneSnapshot> = None;
     for pane in panes {
         if !pane_path_matches_workspace(&pane.current_path, workspace) {
             continue;
         }
+        all_workspace_panes.push(pane.clone());
         if is_idle_shell_command(&pane.current_command) {
             idle_shell.get_or_insert(pane);
-        } else {
-            return SessionLifecycleSummary {
-                kind: SessionLifecycleKind::RunningProcess,
-                pane_id: Some(pane.pane_id),
-                pane_command: Some(pane.current_command),
-                pane_path: Some(pane.current_path),
-                workspace_dirty,
-                abandoned: false,
-            };
+        } else if running_pane.is_none() {
+            running_pane = Some(pane);
         }
+    }
+
+    if let Some(pane) = running_pane {
+        return SessionLifecycleSummary {
+            kind: SessionLifecycleKind::RunningProcess,
+            pane_id: Some(pane.pane_id),
+            pane_command: Some(pane.current_command),
+            pane_path: Some(pane.current_path),
+            workspace_dirty,
+            abandoned: false,
+            all_panes: all_workspace_panes,
+        };
     }
 
     if let Some(pane) = idle_shell {
@@ -5778,6 +5947,7 @@ fn classify_session_lifecycle_from_panes(
             pane_path: Some(pane.current_path),
             workspace_dirty,
             abandoned: workspace_dirty,
+            all_panes: all_workspace_panes,
         }
     } else {
         SessionLifecycleSummary {
@@ -5787,6 +5957,7 @@ fn classify_session_lifecycle_from_panes(
             pane_path: None,
             workspace_dirty,
             abandoned: workspace_dirty,
+            all_panes: all_workspace_panes,
         }
     }
 }
@@ -6040,7 +6211,26 @@ fn parse_git_workspace_summary(status: Option<&str>) -> GitWorkspaceSummary {
     };
 
     for line in status.lines() {
-        if line.starts_with("## ") || line.trim().is_empty() {
+        if line.starts_with("## ") {
+            // #89: detect mid-operation states from branch header
+            // git status --short --branch shows:
+            //   "## HEAD (no branch, rebasing feature-branch)"
+            //   "## main [merge-in-progress]"
+            //   "## HEAD (no branch, cherry-pick-in-progress)"
+            //   "## main (no branch, bisect-in-progress)"
+            let header = line.to_ascii_lowercase();
+            if header.contains("rebasing") {
+                summary.operation = GitOperation::Rebase;
+            } else if header.contains("merge-in-progress") {
+                summary.operation = GitOperation::Merge;
+            } else if header.contains("cherry-pick-in-progress") {
+                summary.operation = GitOperation::CherryPick;
+            } else if header.contains("bisect-in-progress") {
+                summary.operation = GitOperation::Bisect;
+            }
+            continue;
+        }
+        if line.trim().is_empty() {
             continue;
         }
 
@@ -6315,14 +6505,16 @@ fn run_resume_command(
                 });
             }
             let backup_path = write_session_clear_backup(session, session_path)?;
+            // #114: preserve the session_id from the file to avoid filename/meta-header
+            // divergence. /clear is "empty this session," not "fork to a new session."
             let previous_session_id = session.session_id.clone();
-            let cleared = new_cli_session()?;
-            let new_session_id = cleared.session_id.clone();
+            let mut cleared = new_cli_session()?;
+            cleared.session_id = previous_session_id.clone();
             cleared.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
                 session: cleared,
                 message: Some(format!(
-                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  claw --resume {}\n  New session      {new_session_id}\n  Session file     {}",
+                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  claw --resume {}\n  Session file     {}",
                     backup_path.display(),
                     backup_path.display(),
                     session_path.display()
@@ -6330,7 +6522,7 @@ fn run_resume_command(
                 json: Some(serde_json::json!({
                     "kind": "clear",
                     "previous_session_id": previous_session_id,
-                    "new_session_id": new_session_id,
+                    "new_session_id": previous_session_id,
                     "backup": backup_path.display().to_string(),
                     "session_file": session_path.display().to_string(),
                 })),
@@ -6617,6 +6809,47 @@ fn run_resume_command(
         SlashCommand::Session { action, target } => {
             run_resumed_session_command(session_path, session, action.as_deref(), target.as_deref())
         }
+        // #341: /tasks is resume-supported — return a no-op with structured JSON
+        SlashCommand::Tasks { args } => {
+            let args_str = args.as_deref().unwrap_or_default();
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format!(
+                    "Tasks\n  Note           Background tasks are only available in the interactive REPL.\n  Command        /tasks {args_str}"
+                )),
+                json: Some(serde_json::json!({
+                    "kind": "tasks",
+                    "action": "list",
+                    "status": "ok",
+                    "note": "Background tasks are only available in the interactive REPL.",
+                    "args": args_str,
+                })),
+            })
+        }
+        // #343: /model is resume-safe — returns model configuration
+        SlashCommand::Model { model } => {
+            let configured_model = config_model_for_current_dir();
+            let resolved_config_model = configured_model
+                .as_deref()
+                .map(resolve_model_alias_with_config);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format!(
+                    "Models\n  Default          {}\n  Config model     {}",
+                    DEFAULT_MODEL,
+                    configured_model.as_deref().unwrap_or("<unset>")
+                )),
+                json: Some(serde_json::json!({
+                    "kind": "models",
+                    "action": "list",
+                    "status": "ok",
+                    "default_model": DEFAULT_MODEL,
+                    "configured_model": configured_model,
+                    "resolved_model": resolved_config_model,
+                    "requested_model": model,
+                })),
+            })
+        }
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
         | SlashCommand::Pr { .. }
@@ -6625,7 +6858,6 @@ fn run_resume_command(
         | SlashCommand::Teleport { .. }
         | SlashCommand::DebugToolCall { .. }
         | SlashCommand::Resume { .. }
-        | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Login
         | SlashCommand::Logout
@@ -6649,7 +6881,6 @@ fn run_resume_command(
         | SlashCommand::PrivacySettings
         | SlashCommand::Plan { .. }
         | SlashCommand::Review { .. }
-        | SlashCommand::Tasks { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
         | SlashCommand::Usage { .. }
@@ -7551,11 +7782,38 @@ impl LiveCli {
                 // Detect context window overflow. Some providers (e.g. OpenAI-compat backends)
                 // return 400 with "no parseable body" instead of a proper context_length_exceeded
                 // error when the request is too large to even parse — treat that as context overflow too.
+                // Also detect model-specific context error markers (e.g. llama.cpp returns
+                // "Context size has been exceeded." / "exceed_context_size_error" / "exceeds the available context size").
                 let is_context_window = error_str.contains("context_window")
                     || error_str.contains("Context window")
-                    || error_str.contains("no parseable body");
+                    || error_str.contains("no parseable body")
+                    || error_str.contains("exceed_context_size")
+                    || error_str.contains("exceeds the available context size")
+                    || error_str
+                        .to_ascii_lowercase()
+                        .contains("context size has been exceeded");
 
-                if is_context_window {
+                // Also treat "assistant stream produced no content" and reqwest decode failures
+                // as recoverable errors that may benefit from auto-compaction. Some backends (e.g.
+                // llama.cpp) return a non-SSE HTTP 500 body when context overflows, causing
+                // reqwest to fail with "error decoding response body" — treat that as context overflow too.
+                let is_no_content = error_str.contains("assistant stream produced no content")
+                    || error_str.contains("Failed to parse input at pos")
+                    || error_str.contains("error decoding response body");
+
+                if is_context_window || is_no_content {
+                    // If the error tells us the server's actual context window, adapt our
+                    // auto-compaction threshold so future auto-compact-trigger checks are accurate.
+                    if let Some(window) = extract_context_window_tokens_from_error(&error_str) {
+                        // Set threshold at 70% of the reported window to leave headroom.
+                        let threshold: u32 = (window as f64 * 0.7).round() as u32;
+                        println!(
+                            "  Server context window: {} tokens — setting auto-compaction threshold to {}",
+                            window, threshold
+                        );
+                        runtime.set_auto_compaction_input_tokens_threshold(threshold);
+                    }
+
                     // A single compaction pass may not free enough context space.
                     // Progressive retry: each round preserves fewer recent messages (4→2→1→0),
                     // trading conversation continuity for a smaller payload until it fits.
@@ -7637,9 +7895,29 @@ impl LiveCli {
                                 let retry_str = retry_error.to_string();
                                 let still_context_window = retry_str.contains("context_window")
                                     || retry_str.contains("Context window")
-                                    || retry_str.contains("no parseable body");
+                                    || retry_str.contains("no parseable body")
+                                    || retry_str.contains("exceed_context_size")
+                                    || retry_str.contains("exceeds the available context size")
+                                    || retry_str
+                                        .to_ascii_lowercase()
+                                        .contains("context size has been exceeded");
+                                let still_no_content = retry_str
+                                    .contains("assistant stream produced no content")
+                                    || retry_str.contains("Failed to parse input at pos")
+                                    || retry_str.contains("error decoding response body");
 
-                                if still_context_window && round + 1 < max_compact_rounds {
+                                if (still_context_window || still_no_content)
+                                    && round + 1 < max_compact_rounds
+                                {
+                                    // If the retry error reveals the context window, adapt threshold.
+                                    if let Some(window) =
+                                        extract_context_window_tokens_from_error(&retry_str)
+                                    {
+                                        let threshold: u32 = (window as f64 * 0.7).round() as u32;
+                                        new_runtime
+                                            .set_auto_compaction_input_tokens_threshold(threshold);
+                                    }
+
                                     // The compacted session was still too large for the model's context.
                                     // Shut down the old runtime, adopt the partially-compacted one,
                                     // and loop — the next round will compact more aggressively.
@@ -8171,7 +8449,8 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let (handle, session) = load_session_reference(&session_ref)?;
+        let (handle, session) =
+            load_session_reference_excluding(&session_ref, Some(&self.session.id))?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
         let runtime = build_runtime(
@@ -8868,16 +9147,17 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
 fn load_session_reference(
     reference: &str,
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
+    load_session_reference_excluding(reference, None)
+}
+
+fn load_session_reference_excluding(
+    reference: &str,
+    exclude_id: Option<&str>,
+) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
     let store = current_session_store()?;
-    // For alias references ("latest", "last", "recent"), allow cross-workspace
-    // resume so /resume latest finds the most recent session globally.
-    // For explicit references, workspace validation is enforced.
-    let result = if runtime::session_control::is_session_reference_alias(reference) {
-        store.load_session_loose(reference)
-    } else {
-        store.load_session(reference)
-    };
-    let loaded = result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    let loaded = store
+        .load_session_excluding(reference, exclude_id)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok((
         SessionHandle {
             id: loaded.handle.id,
@@ -9041,7 +9321,23 @@ fn run_resumed_session_command(
                 })),
             })
         }
-        Some("switch" | "fork") => Err("unsupported_resumed_command: /session switch and /session fork require an interactive REPL.\nUsage: claw (then /session switch <id>) or claw --resume <session>".into()),
+        // #113: /session switch and /session fork require an interactive REPL —
+        // return structured JSON instead of a raw error so resume callers can
+        // detect the limitation programmatically.
+        Some(switch_or_fork @ ("switch" | "fork")) => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(format!(
+                "/session {switch_or_fork} requires an interactive REPL.\nUsage: claw (then /session {switch_or_fork} <id>)"
+            )),
+            json: Some(serde_json::json!({
+                "kind": "error",
+                "error_kind": "unsupported_resumed_command",
+                "status": "error",
+                "action": switch_or_fork,
+                "error": format!("/session {switch_or_fork} requires an interactive REPL"),
+                "hint": format!("Start a new claw session and use /session {switch_or_fork} <id> interactively"),
+            })),
+        }),
         Some(other) => Err(format!("unsupported_resumed_command: /session {other} is not supported in resume mode.\nSupported: list, exists, delete").into()),
     }
 }
@@ -9339,11 +9635,17 @@ fn status_json_value(
             "cwd": context.cwd,
             "project_root": context.project_root,
             "git_branch": context.git_branch,
-            "git_state": context.git_summary.headline(),
+            "git_state": if context.project_root.is_some() { context.git_summary.headline() } else { "no_git_repo".to_string() },
             // #408: changed_files counts ALL non-clean files (staged + unstaged + untracked + conflicted)
             "changed_files": context.git_summary.changed_files,
             "is_clean": context.git_summary.changed_files == 0,
             "staged_files": context.git_summary.staged_files,
+            // #89: mid-operation git state (rebase, merge, cherry-pick, bisect)
+            "git_operation": if context.git_summary.operation != GitOperation::None {
+                Some(context.git_summary.operation.as_str())
+            } else {
+                None::<&str>
+            },
 
             "unstaged_files": context.git_summary.unstaged_files,
             "untracked_files": context.git_summary.untracked_files,
@@ -9382,10 +9684,25 @@ fn status_json_value(
     })
 }
 
+/// #421: Strip macOS `/private` symlink prefix from paths so that
+/// `status`, `doctor`, and `mcp list` JSON output matches the
+/// user-visible invocation cwd instead of the canonicalized path.
+fn friendly_cwd(path: PathBuf) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(stripped) = path.strip_prefix("/private") {
+            if stripped.is_absolute() {
+                return stripped.to_path_buf();
+            }
+        }
+    }
+    path
+}
+
 fn status_context(
     session_path: Option<&Path>,
 ) -> Result<StatusContext, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
+    let cwd = friendly_cwd(env::current_dir()?);
     let loader = ConfigLoader::default_for(&cwd);
     // #456: count only paths that exist on disk, matching check_config_health behavior.
     let discovered_config_files = loader.discover().iter().filter(|e| e.path.exists()).count();
@@ -9586,7 +9903,11 @@ fn format_status_report(
                 .as_ref()
                 .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
             context.git_branch.as_deref().unwrap_or("unknown"),
-            context.git_summary.headline(),
+            if context.project_root.is_some() {
+                context.git_summary.headline()
+            } else {
+                "no_git_repo".to_string()
+            },
             context.git_summary.changed_files,
             context.git_summary.staged_files,
             context.git_summary.unstaged_files,
@@ -10339,6 +10660,22 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
             "skills" => runtime_config.get("skills").map(|value| value.render()),
             "agents" => runtime_config.get("agents").map(|value| value.render()),
             "settings" => Some(runtime_config.as_json().render()),
+            // #344: /config help shows available sections
+            "help" => {
+                lines.push("Available config sections:".to_string());
+                lines.push("  env          Environment variables".to_string());
+                lines.push("  hooks        Hook configuration".to_string());
+                lines.push("  model        Model configuration".to_string());
+                lines.push("  plugins      Plugin configuration".to_string());
+                lines.push("  mcp          MCP server configuration".to_string());
+                lines.push("  sandbox      Sandbox configuration".to_string());
+                lines.push("  permissions  Permission rules".to_string());
+                lines.push("  skills       Skills configuration".to_string());
+                lines.push("  agents       Agent configuration".to_string());
+                lines.push("  settings     Full merged settings".to_string());
+                lines.push(format!("  Loaded keys: {}", runtime_config.merged().len()));
+                return Ok(lines.join("\n"));
+            }
             other => {
                 lines.push(format!(
                     "  Unsupported config section '{other}'. Use: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents, or settings."
@@ -10451,10 +10788,21 @@ fn render_config_json(
             "skills" => runtime_config.get("skills").map(|v| v.render()),
             "agents" => runtime_config.get("agents").map(|v| v.render()),
             "settings" => Some(runtime_config.as_json().render()),
+            // #344: /config help returns structured section list
+            "help" => {
+                return Ok(serde_json::json!({
+                    "kind": "config",
+                    "action": "help",
+                    "status": "ok",
+                    "section": "help",
+                    "available_sections": ["env", "hooks", "model", "plugins", "mcp", "sandbox", "permissions", "skills", "agents", "settings"],
+                    "loaded_keys": runtime_config.merged().len(),
+                }));
+            }
             other => {
                 // #741: populate hint field for unsupported section errors so callers reading
                 // .hint get actionable guidance instead of null
-                let hint = if matches!(other, "list" | "show" | "help" | "info") {
+                let hint = if matches!(other, "list" | "show" | "info") {
                     format!(
                         "'claw config {other}' is not a subcommand. To list all config: `claw config`. To inspect a section: `claw config <section>` where section is one of: env, hooks, model, plugins, mcp, sandbox, permissions, skills, agents, settings."
                     )
@@ -12487,6 +12835,64 @@ fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
         .is_some_and(|message| message.role == MessageRole::Tool)
 }
 
+/// Extract the server-reported context window size from an error message.
+/// Returns `None` if no window size can be parsed.  The server must
+/// mention something like "context size (81920 tokens)" or "available
+/// context size (81920 tokens)" — the number inside parens after the
+/// parenthesised phrase is taken as the window.
+///
+/// Known formats:
+///   - "exceeds the available context size (81920 tokens)"
+///   - "context size (128000 tokens)"
+///   - "maximum context length is 200000 tokens"
+fn extract_context_window_tokens_from_error(error_str: &str) -> Option<u32> {
+    // Pattern: "(NNNNNN tokens)" appearing after context-size markers
+    for line in error_str.lines() {
+        let lowered = line.to_ascii_lowercase();
+        if lowered.contains("context size")
+            || lowered.contains("context length")
+            || lowered.contains("context window")
+        {
+            // Try parenthesised form: (81920 tokens)
+            if let Some(start) = lowered.find('(') {
+                if let Some(end) = lowered.find(")") {
+                    if start < end {
+                        let inner = &line[start + 1..end];
+                        let digits: String =
+                            inner.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        if let Ok(n) = digits.parse::<u32>() {
+                            if n > 1000 {
+                                return Some(n);
+                            }
+                        }
+                    }
+                }
+            }
+            // Try "maximum context length is NNNNNN tokens"
+            if let Some(pos) = lowered.find("is ") {
+                let rest = &line[pos + 3..];
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = digits.parse::<u32>() {
+                    if n > 1000 {
+                        return Some(n);
+                    }
+                }
+            }
+            // Try "configured limit of NNNNNN tokens"
+            if let Some(pos) = lowered.find("of ") {
+                let rest = &line[pos + 3..];
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = digits.parse::<u32>() {
+                    if n > 1000 {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
     if error.is_context_window_failure() {
         format_context_window_blocked_error(session_id, error)
@@ -13777,15 +14183,30 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     let message = String::from_utf8(buffer)?;
     match output_format {
         CliOutputFormat::Text => print!("{message}"),
-        CliOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "help",
-                "action": "help",
-                "status": "ok",
-                "message": message,
-            }))?
-        ),
+        CliOutputFormat::Json => {
+            // #325: include structured command list in top-level help JSON
+            let commands: Vec<serde_json::Value> = commands::slash_command_specs()
+                .iter()
+                .map(|spec| {
+                    serde_json::json!({
+                        "name": spec.name,
+                        "summary": spec.summary,
+                        "resume_supported": spec.resume_supported,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "help",
+                    "action": "help",
+                    "status": "ok",
+                    "message": message,
+                    "commands": commands,
+                    "total_commands": commands.len(),
+                }))?
+            );
+        }
     }
     Ok(())
 }
@@ -13814,10 +14235,11 @@ mod tests {
         run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
         split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
         try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PermissionModeProvenance,
-        PromptHistoryEntry, SessionLifecycleKind, SessionLifecycleSummary, SlashCommand,
-        StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        CliOutputFormat, CliToolExecutor, GitOperation, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
+        SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL,
+        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -13875,7 +14297,8 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
-        };
+            retry_after: None,
+};
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
         assert!(rendered.contains("provider_internal"));
@@ -13898,7 +14321,8 @@ mod tests {
                 body: String::new(),
                 retryable: true,
                 suggested_action: None,
-            }),
+                retry_after: None,
+}),
         };
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
@@ -13962,7 +14386,8 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
-        };
+            retry_after: None,
+};
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
         assert!(rendered.contains("context_window_blocked"), "{rendered}");
@@ -13995,6 +14420,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
@@ -14029,6 +14455,7 @@ mod tests {
                 body: String::new(),
                 retryable: false,
                 suggested_action: None,
+                retry_after: None,
             }),
         };
 
@@ -14764,7 +15191,7 @@ mod tests {
         let args = vec![
             "system-prompt".to_string(),
             "--cwd".to_string(),
-            "/tmp/project".to_string(),
+            "/tmp".to_string(),
             "--date".to_string(),
             "2026-04-01".to_string(),
         ];
@@ -14776,7 +15203,7 @@ mod tests {
         assert_eq!(
             action,
             CliAction::PrintSystemPrompt {
-                cwd: PathBuf::from("/tmp/project"),
+                cwd: PathBuf::from("/tmp"),
                 date: "2026-04-01".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
@@ -17157,6 +17584,7 @@ mod tests {
                     unstaged_files: 1,
                     untracked_files: 1,
                     conflicted_files: 0,
+                    operation: GitOperation::None,
                 },
                 branch_freshness: test_branch_freshness(),
                 stale_base_state: super::BaseCommitState::NoExpectedBase,
@@ -17167,6 +17595,7 @@ mod tests {
                     pane_path: Some(PathBuf::from("/tmp/project")),
                     workspace_dirty: true,
                     abandoned: true,
+                    all_panes: vec![],
                 },
                 boot_preflight: test_boot_preflight(),
                 sandbox_status: runtime::SandboxStatus::default(),
@@ -17321,6 +17750,7 @@ mod tests {
                 pane_path: None,
                 workspace_dirty: false,
                 abandoned: false,
+                all_panes: vec![],
             },
             boot_preflight: test_boot_preflight(),
             sandbox_status: runtime::SandboxStatus::default(),
@@ -17374,6 +17804,7 @@ mod tests {
                 pane_path: None,
                 workspace_dirty: false,
                 abandoned: false,
+                all_panes: vec![],
             },
             boot_preflight: test_boot_preflight(),
             sandbox_status: runtime::SandboxStatus::default(),
@@ -17419,6 +17850,7 @@ mod tests {
                 pane_path: Some(PathBuf::from("/tmp/project")),
                 workspace_dirty: false,
                 abandoned: false,
+                all_panes: vec![],
             },
             boot_preflight: test_boot_preflight(),
             sandbox_status: runtime::SandboxStatus::default(),
@@ -17528,6 +17960,7 @@ mod tests {
             unstaged_files: 1,
             untracked_files: 0,
             conflicted_files: 0,
+            operation: GitOperation::None,
         };
 
         let preflight = format_commit_preflight_report(Some("feature/ux"), summary);
@@ -17651,6 +18084,7 @@ UU conflicted.rs",
                 unstaged_files: 2,
                 untracked_files: 1,
                 conflicted_files: 1,
+                operation: GitOperation::None,
             }
         );
         assert_eq!(
@@ -17974,16 +18408,26 @@ UU conflicted.rs",
         std::env::set_current_dir(&workspace).expect("switch cwd");
 
         let older = create_managed_session_handle("session-older").expect("older handle");
-        Session::new()
-            .with_persistence_path(older.path.clone())
-            .save_to_path(&older.path)
-            .expect("older session should save");
+        {
+            let mut session = Session::new().with_persistence_path(older.path.clone());
+            session
+                .push_user_text("older session message")
+                .expect("older message should save");
+            session
+                .save_to_path(&older.path)
+                .expect("older session should save");
+        }
         std::thread::sleep(Duration::from_millis(20));
         let newer = create_managed_session_handle("session-newer").expect("newer handle");
-        Session::new()
-            .with_persistence_path(newer.path.clone())
-            .save_to_path(&newer.path)
-            .expect("newer session should save");
+        {
+            let mut session = Session::new().with_persistence_path(newer.path.clone());
+            session
+                .push_user_text("newer session message")
+                .expect("newer message should save");
+            session
+                .save_to_path(&newer.path)
+                .expect("newer session should save");
+        }
 
         let resolved = resolve_session_reference("latest").expect("latest session should resolve");
         assert_eq!(
@@ -19252,5 +19696,17 @@ mod alias_resolution_tests {
         let model = "openai/gpt-4o";
         assert_eq!(resolve_model_alias_with_config(model), model);
         assert!(validate_model_syntax(model).is_ok());
+    }
+    #[test]
+    fn test_ollama_host_bypasses_model_validation() {
+        // Safety: test sets and clears env var within the test.
+        std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:11434");
+        // Ollama model names with colons pass
+        assert!(validate_model_syntax("qwen3:8b").is_ok());
+        assert!(validate_model_syntax("gemma4:e2b").is_ok());
+        assert!(validate_model_syntax("qwen3.6:27b-nvfp4").is_ok());
+        // Empty model still rejected
+        assert!(validate_model_syntax("").is_err());
+        std::env::remove_var("OLLAMA_HOST");
     }
 }
